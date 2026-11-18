@@ -1,7 +1,7 @@
 """
 watch_list.py — Multi-Creator GTA 6 Launch Radar (Hindi + English)
-Automatically checks which creators are currently live, captures hype spikes,
-renders vertical Shorts, and uploads them directly to Google Drive.
+Scans all 8 creators, listens for up to 30 minutes total across active streams,
+extracts only the single highest-virality Short (if one exists), and uploads to Drive.
 """
 import argparse
 import json
@@ -12,7 +12,6 @@ from pathlib import Path
 
 from config import BASE_DIR
 from live_chat_watcher import run_live_monitor
-from drive_uploader import upload_clip_to_drive
 
 COOKIES_FILE = BASE_DIR / "cookies.txt"
 logger = logging.getLogger("watch_list")
@@ -33,7 +32,7 @@ def check_channel_live(handle: str) -> dict | None:
     """Check if `https://www.youtube.com/<handle>/live` is actively streaming right now."""
     live_url = f"https://www.youtube.com/{handle}/live"
     cmd = ["yt-dlp", "--dump-json", "--no-playlist", "--remote-components", "ejs:github"]
-    if COOKIES_FILE.exists():
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
         cmd += ["--cookies", str(COOKIES_FILE)]
     cmd.append(live_url)
 
@@ -54,8 +53,8 @@ def check_channel_live(handle: str) -> dict | None:
     return None
 
 
-def scan_and_clip(listen_sec: int = 360, top_per_creator: int = 1, max_creators: int = 3, upload_drive: bool = True) -> dict:
-    """Scan all 8 creators in priority order, clip top spikes, and upload to Drive."""
+def scan_and_clip(listen_sec: int = 1800, top_total: int = 1, max_creators: int = 2) -> dict:
+    """Scan all 8 creators, split the 30-min budget across active streams, and keep only top_total viral clips."""
     t0 = time.time()
     active_streams = []
 
@@ -72,24 +71,28 @@ def scan_and_clip(listen_sec: int = 360, top_per_creator: int = 1, max_creators:
             "elapsed_sec": round(time.time() - t0, 1),
             "active_creators": [],
             "clips_created": 0,
-            "summary": "None of the 8 watched creators are live right now.",
+            "summary": "None of the 8 watched creators are live right now — skipping run.",
         }
 
     targets = active_streams[:max_creators]
-    
+    per_creator_listen = max(300, listen_sec // len(targets))
     all_results = []
+
     for stream in targets:
-        logger.info(f"Monitoring {stream['name']} for {listen_sec}s...")
-        run_res = run_live_monitor(stream["webpage_url"], listen_sec=listen_sec, top_n=top_per_creator)
+        if len(all_results) >= top_total:
+            logger.info("Target viral clip already captured for this hourly window — stopping radar.")
+            break
+
+        remaining_clips = top_total - len(all_results)
+        logger.info(f"Monitoring {stream['name']} for {per_creator_listen}s (seeking top {remaining_clips} viral clip)...")
+        run_res = run_live_monitor(
+            stream["webpage_url"],
+            listen_sec=per_creator_listen,
+            top_n=remaining_clips,
+        )
         for item in run_res.get("results", []):
-            if item.get("success") and upload_drive:
-                try:
-                    drive_info = upload_clip_to_drive(Path(item["path"]))
-                    item["drive"] = drive_info
-                except Exception as e:
-                    logger.warning(f"Drive upload failed for {item['path']}: {e}")
-                    item["drive_error"] = str(e)
-            all_results.append({"creator": stream["name"], **item})
+            if item.get("success"):
+                all_results.append({"creator": stream["name"], **item})
 
     return {
         "success": True,
@@ -97,23 +100,26 @@ def scan_and_clip(listen_sec: int = 360, top_per_creator: int = 1, max_creators:
         "active_creators": [s["name"] for s in active_streams],
         "clips_created": len(all_results),
         "results": all_results,
+        "summary": (
+            f"Captured {len(all_results)} viral clip(s) from {len(active_streams)} live creator(s)."
+            if all_results
+            else "No moment met the virality threshold during this 30-minute window — skipped."
+        ),
     }
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--listen", type=int, default=360, help="Seconds to listen per live creator (default 360s)")
-    parser.add_argument("--top", type=int, default=1, help="Max clips per live creator (default 1)")
-    parser.add_argument("--max-creators", type=int, default=3, help="Max live creators to process per run")
-    parser.add_argument("--no-drive", action="store_true", help="Skip Google Drive upload")
+    parser.add_argument("--listen", type=int, default=1800, help="Total seconds to monitor live chat (default 1800s = 30m)")
+    parser.add_argument("--top", type=int, default=1, help="Max total viral clips per hourly run (default 1)")
+    parser.add_argument("--max-creators", type=int, default=2, help="Max live creators to split the 30m window across")
     args = parser.parse_args()
     print(json.dumps(
         scan_and_clip(
             listen_sec=args.listen,
-            top_per_creator=args.top,
+            top_total=args.top,
             max_creators=args.max_creators,
-            upload_drive=not args.no_drive,
         ),
         indent=2,
     ))

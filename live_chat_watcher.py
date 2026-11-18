@@ -1,7 +1,7 @@
 """
 live_chat_watcher.py — Real-time YouTube Live Chat Velocity & Hype-Burst Clipper
 Supports English + Hindi/Hinglish streams (IShowSpeed, Techno Gamerz, GamerFleet, Triggered Insaan, etc.)
-Includes audio peak reaction alignment, faster-whisper live captions, and duplicate clip protection.
+Includes strict virality filtering, audio peak alignment, faster-whisper captions, and duplicate protection.
 """
 import argparse
 import json
@@ -22,9 +22,10 @@ WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 COOKIES_FILE = BASE_DIR / "cookies.txt"
 HISTORY_FILE = WORKSPACE_DIR / "clip_history.json"
 
+MIN_VIRALITY_SCORE = 82
+
 logger = logging.getLogger("live_chat_watcher")
 
-# English + Hindi/Hinglish viral reaction tokens (case-insensitive)
 HYPE_PATTERN = re.compile(
     r"\b(w+|l+|lmao+|lmfao+|lol+|wtf+|omg+|no\s*way|what+|bro+|clip(\s*it)?|gg+|ez+|"
     r"op+|bhai+|arey+|abe+|kya+|pagal|gajab|mast|khatarnak|haha+|xd+|💀|😭|🔥|😱|😂)\b",
@@ -87,7 +88,7 @@ def get_live_metadata(url: str) -> dict:
     }
 
 
-def collect_live_chat(url: str, duration_sec: int = 480) -> Path:
+def collect_live_chat(url: str, duration_sec: int = 1800) -> Path:
     """Record live chat JSONL via yt-dlp for `duration_sec` seconds."""
     chat_prefix = WORKSPACE_DIR / "live_chat_capture"
     for old in WORKSPACE_DIR.glob("live_chat_capture*"):
@@ -101,7 +102,7 @@ def collect_live_chat(url: str, duration_sec: int = 480) -> Path:
         "--remote-components", "ejs:github",
         "-o", str(chat_prefix),
     ]
-    if COOKIES_FILE.exists():
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
         cmd += ["--cookies", str(COOKIES_FILE)]
     cmd.append(url)
 
@@ -123,7 +124,7 @@ def collect_live_chat(url: str, duration_sec: int = 480) -> Path:
     return files[0]
 
 
-def detect_chat_spikes(chat_file: Path, stream_start_ts: float | None, top_k: int = 2) -> list[dict]:
+def detect_chat_spikes(chat_file: Path, stream_start_ts: float | None, top_k: int = 1) -> list[dict]:
     """Parse YouTube live_chat JSONL and score 10-second buckets by UNIQUE hype authors."""
     buckets = defaultdict(lambda: {"authors": set(), "hype_authors": set(), "messages": []})
     first_msg_sec = None
@@ -184,7 +185,8 @@ def detect_chat_spikes(chat_file: Path, stream_start_ts: float | None, top_k: in
     for b_sec, info in sorted(buckets.items()):
         unique_total = len(info["authors"])
         unique_hype = len(info["hype_authors"])
-        if unique_hype < 2 and unique_total < 4:
+        # Strict floor: ignore routine chatter, require genuine hype burst
+        if unique_hype < 6 and unique_total < 12:
             continue
         score = (unique_hype * 2.5) + unique_total
         offset_sec = max(0.0, b_sec - base_ts)
@@ -225,7 +227,7 @@ def slice_live_segment(url: str, start_ts: str, end_ts: str, out_path: Path, sec
         "-f", "best[height<=1080][protocol!*=dash]/best[protocol!*=dash]/best",
         "--remote-components", "ejs:github",
     ]
-    if COOKIES_FILE.exists():
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
         url_cmd += ["--cookies", str(COOKIES_FILE)]
     url_cmd.append(url)
 
@@ -311,7 +313,7 @@ def _transcribe_live_cues(raw_path: Path) -> list[dict]:
 
 
 def _generate_live_clip_meta(spike: dict, stream_meta: dict) -> dict:
-    """Pass a structured signals dict into analyzer.find_viral_clips for Gemini hook/title generation."""
+    """Pass live chat + spike signals into analyzer.find_viral_clips for Gemini hook/title & virality scoring."""
     synthetic_transcript = (
         f"[00:00:00 -> 00:00:50] LIVE CHAT EXPLOSION "
         f"({spike['unique_hype']} hype viewers / {spike['unique_total']} total active): "
@@ -321,7 +323,7 @@ def _generate_live_clip_meta(spike: dict, stream_meta: dict) -> dict:
         "start_time": "00:00:00",
         "end_time": "00:00:50",
         "duration_sec": 50.0,
-        "virality_score": min(99, int(75 + spike["unique_hype"])),
+        "virality_score": min(99, int(72 + (spike["unique_hype"] * 1.5))),
         "confidence": 88,
         "category": "comedy",
         "title": f"{stream_meta['channel']} Craziest Live Moment",
@@ -351,7 +353,7 @@ def _generate_live_clip_meta(spike: dict, stream_meta: dict) -> dict:
     return fallback
 
 
-def run_live_monitor(url: str, listen_sec: int = 480, top_n: int = 2) -> dict:
+def run_live_monitor(url: str, listen_sec: int = 1800, top_n: int = 1) -> dict:
     """Full live chat burst pipeline -> returns same result format as pipeline.run_pipeline()."""
     t0 = time.time()
     meta = get_live_metadata(url)
@@ -366,20 +368,30 @@ def run_live_monitor(url: str, listen_sec: int = 480, top_n: int = 2) -> dict:
         return vod_res
 
     chat_file = collect_live_chat(meta["webpage_url"], duration_sec=listen_sec)
-    spikes = detect_chat_spikes(chat_file, meta.get("release_timestamp"), top_k=top_n)
+    # Grab top 3 candidate spikes so if #1 is already clipped or low-score, #2 can be evaluated
+    spikes = detect_chat_spikes(chat_file, meta.get("release_timestamp"), top_k=max(3, top_n * 2))
 
     if not spikes:
         return {
             "success": True,
             "elapsed_sec": round(time.time() - t0, 1),
             "results": [],
-            "summary": f"No major chat spikes detected during {listen_sec}s window on {meta['title']}.",
+            "summary": f"No major chat spikes detected during {listen_sec}s window on {meta['title']} — skipped.",
         }
 
     results = []
     for idx, sp in enumerate(spikes, 1):
+        if len(results) >= top_n:
+            break
+
         if _is_already_clipped(meta["video_id"], sp["bucket_sec"]):
             logger.info(f"Skipping already-clipped moment on {meta['video_id']} (bucket {sp['bucket_sec']}).")
+            continue
+
+        clip_meta = _generate_live_clip_meta(sp, meta)
+        v_score = clip_meta.get("virality_score", 0)
+        if v_score < MIN_VIRALITY_SCORE:
+            logger.info(f"Skipping low-virality spike (score {v_score}/100 < {MIN_VIRALITY_SCORE}).")
             continue
 
         raw_slice = WORKSPACE_DIR / f"live_slice_{idx}.mp4"
@@ -388,7 +400,6 @@ def run_live_monitor(url: str, listen_sec: int = 480, top_n: int = 2) -> dict:
 
         clip_start_sec, clip_end_sec = _align_to_audio_peak(raw_slice, total_sec=50.0)
         live_cues = _transcribe_live_cues(raw_slice)
-        clip_meta = _generate_live_clip_meta(sp, meta)
 
         out_mp4 = OUTPUT_DIR / f"live_clip_{idx:02d}_{meta['video_id']}.mp4"
         preset = CATEGORY_TO_PRESET.get(clip_meta.get("category", "comedy"), "default")
@@ -408,14 +419,14 @@ def run_live_monitor(url: str, listen_sec: int = 480, top_n: int = 2) -> dict:
         qc = check_video(out_mp4) if out_mp4.exists() else {"passed": False}
         if rendered and out_mp4.exists():
             _mark_clipped(meta["video_id"], sp["bucket_sec"])
-        out_mp4.with_suffix(".json").write_text(json.dumps(clip_meta, indent=2), encoding="utf-8")
-        results.append({
-            "index": idx,
-            "success": bool(rendered and out_mp4.exists()),
-            "path": str(out_mp4),
-            "clip": clip_meta,
-            "qc": qc,
-        })
+            out_mp4.with_suffix(".json").write_text(json.dumps(clip_meta, indent=2), encoding="utf-8")
+            results.append({
+                "index": idx,
+                "success": True,
+                "path": str(out_mp4),
+                "clip": clip_meta,
+                "qc": qc,
+            })
 
     from drive_uploader import upload_clip_to_drive
     for r in results:
@@ -426,7 +437,7 @@ def run_live_monitor(url: str, listen_sec: int = 480, top_n: int = 2) -> dict:
         "success": True,
         "elapsed_sec": round(time.time() - t0, 1),
         "results": results,
-        "summary": f"Processed {len(results)} live chat spike(s) from {meta['title']}.",
+        "summary": f"Processed {len(results)} viral live clip(s) from {meta['title']}.",
     }
 
 
@@ -434,7 +445,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("url", help="Live YouTube URL or @Channel/live")
-    parser.add_argument("--listen", type=int, default=480, help="Seconds to monitor chat (default 480s)")
-    parser.add_argument("--top", type=int, default=2, help="Max spike clips to render")
+    parser.add_argument("--listen", type=int, default=1800, help="Seconds to monitor chat (default 1800s)")
+    parser.add_argument("--top", type=int, default=1, help="Max spike clips to render (default 1)")
     args = parser.parse_args()
     print(json.dumps(run_live_monitor(args.url, listen_sec=args.listen, top_n=args.top), indent=2))

@@ -1,7 +1,7 @@
 """
 clipper.py — Video download, rendering, and editing for GTA6 AI Content Factory
 Renders 1080x1920 (9:16) vertical Shorts with:
-- Dynamic AI facecam tracking & cropping
+- Full corner webcam capture on top + gameplay on bottom (no head/hair cutoff)
 - Four editing presets: comedy, action, cinematic, discovery (optimized with veryfast preset)
 - ASS caption burning
 - Audio loudness normalization
@@ -103,11 +103,11 @@ def get_yunet_detector(w: int, h: int):
     if not YUNET_PATH.exists():
         print("[Clipper] Downloading YuNet face detection model...")
         urllib.request.urlretrieve(YUNET_URL, YUNET_PATH)
-    return cv2.FaceDetectorYN.create(str(YUNET_PATH), "", (w, h), 0.75, 0.3, 5000)
+    return cv2.FaceDetectorYN.create(str(YUNET_PATH), "", (w, h), 0.70, 0.3, 5000)
 
 
-def detect_facecam_box(video_path: Path) -> Optional[tuple[int, int, int, int]]:
-    """Dynamically detects the exact bounding box (x, y, w, h) of the facecam using YuNet."""
+def detect_facecam_corner(video_path: Path) -> Optional[str]:
+    """Detects which screen corner holds the streamer webcam using YuNet."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return None
@@ -120,31 +120,39 @@ def detect_facecam_box(video_path: Path) -> Optional[tuple[int, int, int, int]]:
         return None
 
     detector = get_yunet_detector(width, height)
-    detected_boxes = []
+    votes: Dict[str, int] = {
+        "top-right": 0,
+        "top-left": 0,
+        "bottom-right": 0,
+        "bottom-left": 0,
+    }
 
     for p in (0.15, 0.35, 0.55, 0.75, 0.90):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * p))
         ok, frame = cap.read()
         if not ok:
             continue
-        
+
         _, faces = detector.detect(frame)
         if faces is not None and len(faces) > 0:
             face = faces[0]
-            fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
-            if fy < height * 0.5:
-                detected_boxes.append((fx, fy, fw, fh))
+            cx = float(face[0]) + (float(face[2]) / 2.0)
+            cy = float(face[1]) + (float(face[3]) / 2.0)
+            is_right = cx >= (width * 0.5)
+            is_bottom = cy >= (height * 0.5)
+
+            if is_right and not is_bottom:
+                votes["top-right"] += 1
+            elif not is_right and not is_bottom:
+                votes["top-left"] += 1
+            elif is_right and is_bottom:
+                votes["bottom-right"] += 1
+            else:
+                votes["bottom-left"] += 1
 
     cap.release()
-    if not detected_boxes:
-        return None
-
-    avg_x = int(sum(b[0] for b in detected_boxes) / len(detected_boxes))
-    avg_y = int(sum(b[1] for b in detected_boxes) / len(detected_boxes))
-    avg_w = int(sum(b[2] for b in detected_boxes) / len(detected_boxes))
-    avg_h = int(sum(b[3] for b in detected_boxes) / len(detected_boxes))
-
-    return (avg_x, avg_y, avg_w, avg_h)
+    best_corner, count = max(votes.items(), key=lambda kv: kv[1])
+    return best_corner if count > 0 else None
 
 
 def download_clip_slice(url: str, start_hms: str, end_hms: str, raw_path: Path) -> bool:
@@ -228,14 +236,7 @@ def render_vertical_short(
     use_nvenc = _has_nvenc(ff_exe)
     trim_end = _detect_trim_end(ff_exe, raw_path)
 
-    cap = cv2.VideoCapture(str(raw_path))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    if width <= 0 or height <= 0:
-        width, height = 1920, 1080
-
-    face_box = detect_facecam_box(raw_path)
+    corner = detect_facecam_corner(raw_path)
 
     with tempfile.TemporaryDirectory(prefix="gta6_") as tmp_dir:
         tmp_path = Path(tmp_dir)
@@ -247,7 +248,7 @@ def render_vertical_short(
         )
 
         hook_file = _write_text_file(hook_text, tmp_path)
-        hook_y = "915" if face_box else "240"
+        hook_y = "915" if corner else "240"
 
         hook_file_escaped = _escape_ffmpeg_filter_path(hook_file)
         font_part = ""
@@ -267,23 +268,15 @@ def render_vertical_short(
         ass_escaped = _escape_ffmpeg_filter_path(ass_path)
         ass_filter = f"ass='{ass_escaped}'" if has_caps else ""
 
-        # Dynamic facecam crop or fallback corner crop
-        if face_box:
-            fx, fy, fw, fh = face_box
-            # Push the crop window higher up to include hair and headphones
-            pad_x = int(fw * 1.4)
-            pad_y = int(fh * 2.2)
-            crop_x = max(0, fx - int(fw * 0.7))
-            crop_y = max(0, fy - int(fh * 1.2))
-            crop_w = min(width - crop_x, int(fw * 3.0) + pad_x)
-            crop_h = min(height - crop_y, int(fh * 2.8) + pad_y)
+        # Full 16:9 corner slice (36% width x 36% height) captures the entire webcam box
+        corner_crops = {
+            "top-right":    "crop=iw*0.36:ih*0.36:iw*0.64:0",
+            "top-left":     "crop=iw*0.36:ih*0.36:0:0",
+            "bottom-right": "crop=iw*0.36:ih*0.36:iw*0.64:ih*0.64",
+            "bottom-left":  "crop=iw*0.36:ih*0.36:0:ih*0.64",
+        }
 
-            cam_crop = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
-            layout_label = f"Dynamic Facecam Box ({crop_w}x{crop_h} @ {crop_x},{crop_y})"
-        else:
-            cam_crop = f"crop=iw*0.42:ih*0.52:iw*0.58:0"
-            layout_label = "Fallback Top-Right Corner Crop"
-
+        layout_label = f"Full Corner Webcam ({corner})" if corner else "Full-Frame Gameplay (No Facecam)"
         print(f"[Clipper] Layout -> {layout_label} | Preset -> {preset.upper()}")
 
         hook_zoom = (
@@ -292,10 +285,14 @@ def render_vertical_short(
             "crop=1080:1920:(iw-1080)/2:(ih-1920)/2"
         )
 
-        if face_box:
+        if corner:
+            cam_crop = corner_crops[corner]
+            # Fit entire webcam inside top 1080x960 pane without zooming/chopping top or bottom
             filter_parts = [
-                f"[0:v]{cam_crop},{eq_filt},scale=1080:960:force_original_aspect_ratio=increase,"
-                f"crop=1080:960,setsar=1[cam]",
+                f"[0:v]{cam_crop},scale=1080:960:force_original_aspect_ratio=increase,"
+                f"crop=1080:960,boxblur=20:8,{eq_filt},eq=brightness=-0.15,setsar=1[cam_bg]",
+                f"[0:v]{cam_crop},{eq_filt},scale=1080:960:force_original_aspect_ratio=decrease,setsar=1[cam_fg]",
+                f"[cam_bg][cam_fg]overlay=(W-w)/2:(H-h)/2,setsar=1[cam]",
                 f"[0:v]crop=ih*9/8:ih:(iw-ih*9/8)/2:0,{eq_filt},scale=1080:960,setsar=1[game]",
                 f"[cam][game]vstack=inputs=2,{hook_zoom}[stacked]",
             ]
@@ -353,7 +350,7 @@ def render_vertical_short(
             cmd_fallback = [
                 ff_exe, "-y",
                 "-i", str(raw_path),
-                "-filter_complex", f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[outv]",
+                "-filter_complex", "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[outv]",
                 "-map", "[outv]",
                 "-map", "0:a?",
                 "-af", audio_filter,
