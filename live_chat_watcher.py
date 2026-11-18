@@ -14,7 +14,7 @@ from pathlib import Path
 
 from config import BASE_DIR, OUTPUT_DIR
 from analyzer import find_viral_clips
-from clipper import render_vertical_short, get_ffmpeg_exe, detect_facecam_corner, CATEGORY_TO_PRESET
+from clipper import render_vertical_short, get_ffmpeg_exe, CATEGORY_TO_PRESET
 from quality_checker import check_video
 
 WORKSPACE_DIR = BASE_DIR / "workspace"
@@ -391,13 +391,11 @@ def run_live_monitor(url: str, listen_sec: int = 480, top_n: int = 2) -> dict:
         clip_meta = _generate_live_clip_meta(sp, meta)
 
         out_mp4 = OUTPUT_DIR / f"live_clip_{idx:02d}_{meta['video_id']}.mp4"
-        corner = detect_facecam_corner(raw_slice)
         preset = CATEGORY_TO_PRESET.get(clip_meta.get("category", "comedy"), "default")
         rendered = render_vertical_short(
             raw_path=raw_slice,
             out_path=out_mp4,
             hook_text=clip_meta.get("hook_overlay", "CHAT WENT CRAZY HERE"),
-            corner=corner,
             cues=live_cues,
             clip_start_sec=clip_start_sec,
             clip_end_sec=clip_end_sec,
