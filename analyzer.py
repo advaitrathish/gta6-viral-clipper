@@ -1,7 +1,7 @@
 """
 analyzer.py — Gemini-powered viral moment identification for GTA6 AI Content Factory
-Sends transcript + heatmap + chat signals to Gemini and returns structured clip candidates.
-All timestamps returned as float seconds (start_sec / end_sec).
+Sends transcript + heatmap + chat signals to Gemini and returns structured clip candidates
+with two-stage editorial context callouts for higher retention and monetization safety.
 """
 import os
 import time
@@ -15,19 +15,26 @@ load_dotenv()
 
 class ViralClip(BaseModel):
     title: str = Field(
-        description="Catchy, high-retention YouTube Shorts title — under 60 characters. Specific to GTA VI."
+        description="Catchy, specific YouTube Shorts title — under 55 characters. Specific to the exact scene."
     )
     hook_overlay: str = Field(
         description=(
-            "Bold 3-7 word ALL-CAPS on-screen text hook for the first 3 seconds. "
-            "Make it shocking, funny, or curiosity-driven."
+            "Specific 4-8 word ALL-CAPS context hook for the first half of the clip explaining "
+            "WHAT is happening (e.g., 'SPOTTING THE SECRET BOAT DROP AT THE DOCK'). "
+            "BANNED generic phrases: 'NO WAY THAT JUST HAPPENED', 'WAIT FOR IT', 'CHAT WENT CRAZY', 'UNBELIEVABLE MOMENT'."
+        )
+    )
+    mid_callout: str = Field(
+        description=(
+            "Specific 4-8 word ALL-CAPS commentary/detail callout shown in the second half of the clip "
+            "highlighting the twist, reaction, or detail (e.g., 'HE GOT STABBED TRYING TO OPEN IT')."
         )
     )
     alternative_hooks: List[str] = Field(
         description=(
-            "Three alternative hook variants using different styles: "
-            "1) Curiosity/question, 2) Humour/reaction, 3) Shock/suspense. "
-            "Each 3-7 words max."
+            "Three alternative specific hook variants: "
+            "1) Curiosity/question, 2) Humour/reaction, 3) Detail/breakdown. "
+            "Each 4-8 words max."
         ),
         min_length=3,
         max_length=3,
@@ -66,13 +73,13 @@ class ViralClip(BaseModel):
     description: str = Field(
         description=(
             "YouTube Shorts description ~100 characters. "
-            "Mention GTA VI and include a call-to-action."
+            "Summarize the exact scene and include a question to spark comments."
         )
     )
     hashtags: List[str] = Field(
         description=(
             "5-8 relevant hashtags. MUST include #GTA6 and #Shorts. "
-            "Example: ['#GTA6', '#Shorts', '#GTA6Funny', '#GTA6Gameplay']"
+            "Example: ['#GTA6', '#Shorts', '#GTA6Gameplay', '#Gaming']"
         ),
         min_length=5,
         max_length=8,
@@ -230,6 +237,7 @@ HARD RULES (DO NOT VIOLATE):
 - Cut immediately after the punchline, peak reaction, or resolution.
 - DO NOT overlap clips — each must cover a unique time range.
 - DO NOT fabricate gameplay details not evident from the transcript.
+- hook_overlay and mid_callout MUST describe the specific scene/event in plain English (NEVER use generic filler like 'NO WAY THAT JUST HAPPENED' or 'WAIT FOR IT').
 - Include exactly 3 alternative hooks with different emotional tones.
 - Hashtags MUST include #GTA6 and #Shorts when relevant.
 - Category MUST be one of: comedy, action, cinematic, discovery, story, fail, unexpected
@@ -309,42 +317,3 @@ Return ONLY valid JSON matching this JSON Schema:
         results.append(d)
 
     return results
-
-
-if __name__ == "__main__":
-    from extractor import fetch_video_signals, parse_vtt_dedup, WORK_DIR
-
-    test_url = input(
-        "Paste YouTube URL to analyze (or press Enter to reuse cached workspace): "
-    ).strip()
-
-    if test_url:
-        sigs = fetch_video_signals(test_url)
-    else:
-        info_files = list(WORK_DIR.glob("target*.info.json"))
-        if not info_files:
-            print("No cached workspace found. Please provide a URL.")
-            exit(1)
-        info = json.loads(info_files[0].read_text(encoding="utf-8"))
-        vtt_list = list(WORK_DIR.glob("target*.vtt"))
-        cues = parse_vtt_dedup(vtt_list[0]) if vtt_list else []
-        sigs = {
-            "title": info.get("title", "Gaming VOD"),
-            "duration_sec": float(info.get("duration") or 0.0),
-            "heatmap_peaks": [],
-            "chat_spikes": [],
-            "cues": cues,
-            "transcript": "\n".join(f"[{c['start']:.1f}s] {c['text']}" for c in cues),
-        }
-
-    clips = find_viral_clips(sigs, max_clips=5)
-    print("\n=== TOP VIRAL CLIPS IDENTIFIED ===")
-    for i, clip in enumerate(clips, 1):
-        print(f"\n#{i} [{clip['start_hms']} -> {clip['end_hms']} | {clip['duration']}s | "
-              f"Score: {clip['virality_score']}/100 | Confidence: {clip['confidence_score']}/100]")
-        print(f"   Category:  {clip['category'].upper()}")
-        print(f"   Title:     {clip['title']}")
-        print(f"   Hook:      {clip['hook_overlay']}")
-        print(f"   Alt Hooks: {clip['alternative_hooks']}")
-        print(f"   Hashtags:  {' '.join(clip['hashtags'])}")
-        print(f"   Why:       {clip['reason']}")

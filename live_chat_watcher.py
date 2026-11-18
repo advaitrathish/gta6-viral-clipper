@@ -592,6 +592,7 @@ def run_monitor(
             clip_start_sec=clip_start_sec,
             clip_end_sec=clip_end_sec,
             preset=preset,
+            mid_text=clip_meta.get("mid_callout", ""),
         )
 
         if raw_slice.exists():
