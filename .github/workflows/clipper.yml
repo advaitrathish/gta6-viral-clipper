@@ -1,0 +1,74 @@
+name: GTA6 Viral Clipper
+
+on:
+  schedule:
+    # Runs once every hour (at :17) to avoid peak-minute queue delays
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'Optional YouTube Live or VOD URL (leave blank to scan all 8 creators)'
+        required: false
+        default: ''
+      top_clips:
+        description: 'Max Shorts to generate'
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  clip-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Set up Deno (for yt-dlp)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install FFmpeg and caption fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-liberation
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore secrets and auth files
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
+        run: |
+          echo "GEMINI_API_KEY=$GEMINI_API_KEY" > .env
+          if [ -n "$YT_COOKIES_B64" ]; then
+            echo "$YT_COOKIES_B64" | base64 -d > cookies.txt
+          fi
+
+      - name: Run Live Radar or Single URL Clipper
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GDRIVE_TOKEN_B64: ${{ secrets.GDRIVE_TOKEN_B64 }}
+          VIDEO_URL: ${{ github.event.inputs.video_url }}
+          TOP_CLIPS: ${{ github.event.inputs.top_clips || '1' }}
+        run: |
+          if [ -n "$VIDEO_URL" ]; then
+            echo "Running single URL mode: $VIDEO_URL"
+            python live_chat_watcher.py "$VIDEO_URL" --listen 1800 --top "$TOP_CLIPS"
+          else
+            echo "Running 8-creator live radar (IShowSpeed -> CarryMinati -> others)"
+            python watch_list.py --listen 1800 --top "$TOP_CLIPS" --max-creators 2
+          fi

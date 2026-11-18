@@ -1,0 +1,81 @@
+# GTA6 AI Content Factory — Git Ignore
+
+# =====================
+# SECRETS — NEVER COMMIT
+# =====================
+.env
+cookies.txt
+credentials.json
+client_secret.json
+token.json
+
+# =====================
+# GENERATED DIRECTORIES
+# =====================
+workspace/
+cache/
+output_clips/
+logs/
+
+# =====================
+# PYTHON
+# =====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.so
+
+# =====================
+# VIRTUAL ENVIRONMENTS
+# =====================
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# =====================
+# BUILD / DIST
+# =====================
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# =====================
+# IDE / EDITOR
+# =====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# =====================
+# LOGS & TEMP
+# =====================
+*.log
+*.tmp
+*.temp
+*.bak
+
+# =====================
+# MEDIA (don't commit large files)
+# =====================
+*.mp4
+*.mp3
+*.wav
+*.avi
+*.mkv
+*.onnx
+
+# =====================
+# GITHUB ACTIONS / CI secrets
+# =====================
+# (never store tokens in workflow files — use repository Secrets)

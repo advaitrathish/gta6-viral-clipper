@@ -1,0 +1,2816 @@
+﻿=== analyzer.py ===
+"""
+analyzer.py â€” Gemini-powered viral moment identification for GTA6 AI Content Factory
+Sends transcript + heatmap + chat signals to Gemini and returns structured clip candidates.
+All timestamps returned as float seconds (start_sec / end_sec).
+"""
+import os
+import time
+import json
+from typing import List, Dict, Optional
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Pydantic schema â€” Gemini must return this exact shape
+# ---------------------------------------------------------------------------
+
+class ViralClip(BaseModel):
+    title: str = Field(
+        description="Catchy, high-retention YouTube Shorts title â€” under 60 characters. Specific to GTA VI."
+    )
+    hook_overlay: str = Field(
+        description=(
+            "Bold 3-7 word ALL-CAPS on-screen text hook for the first 3 seconds. "
+            "Make it shocking, funny, or curiosity-driven."
+        )
+    )
+    alternative_hooks: List[str] = Field(
+        description=(
+            "Three alternative hook variants using different styles: "
+            "1) Curiosity/question, 2) Humour/reaction, 3) Shock/suspense. "
+            "Each 3-7 words max."
+        ),
+        min_length=3,
+        max_length=3,
+    )
+    start_sec: float = Field(
+        description="Exact start timestamp in seconds (float). Start 2-3s before the setup begins."
+    )
+    end_sec: float = Field(
+        description=(
+            "Exact end timestamp in seconds (float). "
+            "CRITICAL: end_sec - start_sec MUST be between 25 and 58 seconds."
+        )
+    )
+    virality_score: int = Field(
+        description=(
+            "Editorial score 1-100 based on: "
+            "hook strength (25%), entertainment value (25%), story completeness (20%), "
+            "visual interest (15%), replay potential (15%)."
+        )
+    )
+    confidence_score: int = Field(
+        description=(
+            "Confidence 1-100 of how certain you are this timestamp range is correct "
+            "and self-contained based on the transcript evidence."
+        )
+    )
+    category: str = Field(
+        description=(
+            "Content category â€” MUST be one of: "
+            "comedy, action, cinematic, discovery, story, fail, unexpected"
+        )
+    )
+    reason: str = Field(
+        description="1-2 sentences explaining why viewers will watch to the end and share this clip."
+    )
+    description: str = Field(
+        description=(
+            "YouTube Shorts description ~100 characters. "
+            "Mention GTA VI and include a call-to-action."
+        )
+    )
+    hashtags: List[str] = Field(
+        description=(
+            "5-8 relevant hashtags. MUST include #GTA6 and #Shorts. "
+            "Example: ['#GTA6', '#Shorts', '#GTA6Funny', '#GTA6Gameplay']"
+        ),
+        min_length=5,
+        max_length=8,
+    )
+
+
+class ClipPlan(BaseModel):
+    clips: List[ViralClip]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def format_timestamp(sec: float) -> str:
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _validate_clips(
+    clips: List[ViralClip],
+    duration_sec: float,
+    min_dur: float = 25.0,
+    max_dur: float = 58.0,
+) -> List[ViralClip]:
+    """
+    Enforce hard constraints on every clip Gemini returns:
+    - duration within [min_dur, max_dur]
+    - end_sec > start_sec
+    - timestamps within source duration
+    - no overlapping clips (keep higher score)
+    """
+    valid: List[ViralClip] = []
+    for c in clips:
+        dur = c.end_sec - c.start_sec
+        if c.start_sec < 0:
+            print(f"[Analyzer] Clip '{c.title}' rejected: negative start_sec ({c.start_sec})")
+            continue
+        if c.end_sec <= c.start_sec:
+            print(f"[Analyzer] Clip '{c.title}' rejected: end_sec <= start_sec")
+            continue
+        if dur < min_dur:
+            print(f"[Analyzer] Clip '{c.title}' rejected: too short ({dur:.1f}s < {min_dur}s)")
+            continue
+        if dur > max_dur:
+            # Try trimming to max rather than throwing away
+            trimmed_end = round(c.start_sec + max_dur, 2)
+            if duration_sec > 0 and trimmed_end > duration_sec:
+                print(f"[Analyzer] Clip '{c.title}' rejected: exceeds source and too long")
+                continue
+            print(f"[Analyzer] Clip '{c.title}' trimmed to {max_dur}s (was {dur:.1f}s)")
+            # pydantic v2: use model_copy
+            c = c.model_copy(update={"end_sec": trimmed_end})
+        if duration_sec > 0 and c.end_sec > duration_sec + 5:
+            print(f"[Analyzer] Clip '{c.title}' rejected: timestamps beyond source duration")
+            continue
+        valid.append(c)
+
+    # Remove overlapping clips â€” keep the one with the higher virality_score
+    valid.sort(key=lambda x: x.virality_score, reverse=True)
+    non_overlapping: List[ViralClip] = []
+    for c in valid:
+        overlap = False
+        for existing in non_overlapping:
+            # Overlap if one starts before the other ends
+            if c.start_sec < existing.end_sec and c.end_sec > existing.start_sec:
+                overlap = True
+                print(
+                    f"[Analyzer] Clip '{c.title}' overlaps with '{existing.title}' "
+                    f"(score {c.virality_score} vs {existing.virality_score}) â€” skipped"
+                )
+                break
+        if not overlap:
+            non_overlapping.append(c)
+
+    return non_overlapping
+
+
+# ---------------------------------------------------------------------------
+# Main analysis function
+# ---------------------------------------------------------------------------
+
+def find_viral_clips(
+    signals: Dict,
+    max_clips: int = 5,
+    force_retry: bool = False,
+) -> List[Dict]:
+    """
+    Call Gemini to identify viral clip candidates from extraction signals.
+    Returns a list of dicts with all clip metadata including start_hms/end_hms.
+    """
+    from config import (
+        GEMINI_API_KEY, GEMINI_MODELS,
+        GEMINI_MAX_RETRIES, GEMINI_BACKOFF_SEC, GEMINI_TEMPERATURE,
+        MIN_CLIP_DURATION, MAX_CLIP_DURATION,
+    )
+
+    api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is missing. Add it to your .env file.")
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise ImportError(
+            "google-genai package not installed. Run: pip install google-genai"
+        )
+
+    client = genai.Client(api_key=api_key)
+
+    # ---- Build prompt inputs ------------------------------------------------
+    raw_transcript = signals.get("transcript", "")
+    if isinstance(raw_transcript, str):
+        transcript_block = raw_transcript
+        cue_count = len(raw_transcript.splitlines())
+    else:
+        transcript_lines = [f"[{cue['start']:.1f}s] {cue['text']}" for cue in raw_transcript]
+        transcript_block = "\n".join(transcript_lines)
+        cue_count = len(transcript_lines)
+
+    # Heatmap: list of "123.4s (intensity 0.87)"
+    heatmap_items = signals.get("heatmap_peaks", [])
+    if heatmap_items and isinstance(heatmap_items[0], dict):
+        heatmap_str = ", ".join(
+            f"{h['start_sec']:.1f}s (intensity {h['intensity']:.2f})"
+            for h in heatmap_items[:20]
+        ) or "None available"
+    else:
+        heatmap_str = "None available"
+
+    # Chat: list of "123.4s (45 msgs/10s)"
+    chat_items = signals.get("chat_spikes", [])
+    if chat_items and isinstance(chat_items[0], dict):
+        chat_str = ", ".join(
+            f"{c['start_sec']:.1f}s ({c['msgs_in_10s']} msgs/10s, {c['hype_msgs']} hype)"
+            for c in chat_items[:20]
+        ) or "None available"
+    else:
+        chat_str = "None available"
+
+    duration_sec  = float(signals.get("duration_sec", 0.0))
+    video_title   = signals.get("title", "GTA VI Gaming VOD")
+    duration_note = f" The source video is {duration_sec:.0f} seconds long." if duration_sec > 0 else ""
+
+    # ---- Prompt -------------------------------------------------------------
+    prompt = f"""You are an elite viral short-form gaming content editor specialising in YouTube Shorts, TikTok and Instagram Reels.
+Your job is to identify the top {max_clips} most viral, self-contained moments from this GTA VI gaming stream or VOD.
+
+VIDEO TITLE: {video_title}{duration_note}
+
+YOUTUBE 'MOST REPLAYED' HEATMAP PEAKS (viewers rewound here repeatedly):
+{heatmap_str}
+
+LIVE CHAT HYPE SPIKES (moments with most chat activity):
+{chat_str}
+
+TIMESTAMPED TRANSCRIPT:
+{transcript_block if transcript_block else "[No transcript available â€” use heatmap and chat signals to estimate viral moments]"}
+
+CONTENT TO PRIORITISE (in order):
+1. Funny NPC interactions or unexpected AI behaviour
+2. Shocking/unexpected story moments  
+3. High-energy reactions and fails
+4. Hidden discoveries or Easter eggs in GTA VI
+5. Intense police chases or action sequences
+6. Cinematic or beautiful environment shots
+7. Interesting mechanics comparisons (GTA 5 vs GTA 6)
+8. Gameplay moments with strong storytelling
+
+HARD RULES (DO NOT VIOLATE):
+- Each clip MUST be between {MIN_CLIP_DURATION:.0f} and {MAX_CLIP_DURATION:.0f} seconds (end_sec - start_sec).
+- Start 2-3 seconds BEFORE the main action so viewers have context.
+- Cut immediately after the punchline, peak reaction, or resolution.
+- DO NOT overlap clips â€” each must cover a unique time range.
+- DO NOT fabricate gameplay details not evident from the transcript.
+- Include exactly 3 alternative hooks with different emotional tones.
+- Hashtags MUST include #GTA6 and #Shorts.
+- Category MUST be one of: comedy, action, cinematic, discovery, story, fail, unexpected
+
+Return exactly {max_clips} clips, ranked by virality potential. If fewer strong moments exist, return at least 1.
+"""
+
+    # ---- Try each model with retries ----------------------------------------
+    last_err: Optional[Exception] = None
+    all_valid: List[ViralClip] = []
+
+    for model_name in GEMINI_MODELS:
+        for attempt in range(GEMINI_MAX_RETRIES + 1):
+            try:
+                print(f"[Analyzer] â†’ {model_name} (attempt {attempt + 1}) sending {cue_count} cues...")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ClipPlan,
+                        temperature=GEMINI_TEMPERATURE,
+                    ),
+                )
+                plan = ClipPlan.model_validate_json(response.text)
+                validated = _validate_clips(
+                    plan.clips, duration_sec, MIN_CLIP_DURATION, MAX_CLIP_DURATION
+                )
+
+                if validated:
+                    all_valid = validated
+                    print(
+                        f"[Analyzer] âœ“ {model_name} returned {len(plan.clips)} clips, "
+                        f"{len(validated)} passed validation."
+                    )
+                    break
+                else:
+                    print(
+                        f"[Analyzer] {model_name} returned {len(plan.clips)} clips but NONE "
+                        f"passed duration/overlap validation. Retrying with stricter prompt..."
+                    )
+                    # Retry once with stricter instructions if first attempt had 0 valid clips
+                    if attempt == 0:
+                        continue
+            except json.JSONDecodeError as je:
+                last_err = je
+                print(f"[Analyzer] {model_name}: JSON parse error â€” {je}")
+                break  # JSON errors won't fix with retry on same model
+            except Exception as e:
+                last_err = e
+                err_str = str(e).lower()
+                # Distinguish transient vs permanent errors
+                if any(x in err_str for x in ("quota", "rate", "429", "503", "timeout")):
+                    wait = GEMINI_BACKOFF_SEC * (2 ** attempt)
+                    print(f"[Analyzer] {model_name}: transient error ({e}). Waiting {wait:.1f}s...")
+                    time.sleep(wait)
+                    continue
+                else:
+                    print(f"[Analyzer] {model_name}: permanent error ({type(e).__name__}: {e})")
+                    break
+
+        if all_valid:
+            break
+
+    if not all_valid:
+        raise RuntimeError(
+            f"All Gemini models failed or returned no valid clips. Last error: {last_err}"
+        )
+
+    # Sort final list by virality score
+    all_valid.sort(key=lambda x: x.virality_score, reverse=True)
+
+    # Convert to plain dicts with HMS helpers
+    results = []
+    for c in all_valid[:max_clips]:
+        d = c.model_dump()
+        d["start_hms"] = format_timestamp(c.start_sec)
+        d["end_hms"]   = format_timestamp(c.end_sec)
+        d["duration"]  = round(c.end_sec - c.start_sec, 1)
+        results.append(d)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CLI self-test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    from extractor import fetch_video_signals, parse_vtt_dedup, WORK_DIR
+    import pathlib
+
+    test_url = input(
+        "Paste YouTube URL to analyze (or press Enter to reuse cached workspace): "
+    ).strip()
+
+    if test_url:
+        sigs = fetch_video_signals(test_url)
+    else:
+        info_files = list(WORK_DIR.glob("target*.info.json"))
+        if not info_files:
+            print("No cached workspace found. Please provide a URL.")
+            exit(1)
+        info     = json.loads(info_files[0].read_text(encoding="utf-8"))
+        vtt_list = list(WORK_DIR.glob("target*.vtt"))
+        cues     = parse_vtt_dedup(vtt_list[0]) if vtt_list else []
+        sigs = {
+            "title":         info.get("title", "Gaming VOD"),
+            "duration_sec":  float(info.get("duration") or 0.0),
+            "heatmap_peaks": [],
+            "chat_spikes":   [],
+            "cues":          cues,
+            "transcript":    "\n".join(f"[{c['start']:.1f}s] {c['text']}" for c in cues),
+        }
+
+    clips = find_viral_clips(sigs, max_clips=5)
+    print("\n=== TOP VIRAL CLIPS IDENTIFIED ===")
+    for i, clip in enumerate(clips, 1):
+        print(f"\n#{i} [{clip['start_hms']} â†’ {clip['end_hms']} | {clip['duration']}s | "
+              f"Score: {clip['virality_score']}/100 | Confidence: {clip['confidence_score']}/100]")
+        print(f"   Category:  {clip['category'].upper()}")
+        print(f"   Title:     {clip['title']}")
+        print(f"   Hook:      {clip['hook_overlay']}")
+        print(f"   Alt Hooks: {clip['alternative_hooks']}")
+        print(f"   Hashtags:  {' '.join(clip['hashtags'])}")
+        print(f"   Why:       {clip['reason']}")
+
+=== cache_manager.py ===
+"""
+cache_manager.py â€” URL-based caching for GTA6 AI Content Factory
+Avoids re-extracting transcripts and re-running Gemini analysis.
+Simple JSON file cache keyed by URL hash.
+"""
+import hashlib
+import json
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+from config import CACHE_DIR
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _url_key(url: str) -> str:
+    """SHA256 hash of the URL as the cache key."""
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+
+def _cache_path(url: str, suffix: str) -> Path:
+    return CACHE_DIR / f"{_url_key(url)}_{suffix}.json"
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def load_signals(url: str) -> Optional[dict]:
+    """Load cached extraction signals for a URL. Returns None if not found."""
+    p = _cache_path(url, "signals")
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            print(f"[Cache] âœ“ Loaded signals from cache (key: {_url_key(url)})")
+            return data
+        except Exception as e:
+            print(f"[Cache] âš  Could not read signals cache: {e}")
+    return None
+
+
+def save_signals(url: str, signals: dict) -> None:
+    """Persist extraction signals for a URL."""
+    p = _cache_path(url, "signals")
+    try:
+        p.write_text(json.dumps(signals, ensure_ascii=False, default=str), encoding="utf-8")
+        print(f"[Cache] Saved signals â†’ {p.name}")
+    except Exception as e:
+        print(f"[Cache] âš  Could not save signals: {e}")
+
+
+def load_clips(url: str) -> Optional[list]:
+    """Load cached Gemini clip analysis for a URL. Returns None if not found."""
+    p = _cache_path(url, "clips")
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            print(f"[Cache] âœ“ Loaded clips from cache (key: {_url_key(url)})")
+            return data
+        except Exception as e:
+            print(f"[Cache] âš  Could not read clips cache: {e}")
+    return None
+
+
+def save_clips(url: str, clips: list) -> None:
+    """Persist Gemini clip analysis for a URL."""
+    p = _cache_path(url, "clips")
+    try:
+        p.write_text(json.dumps(clips, ensure_ascii=False, default=str), encoding="utf-8")
+        print(f"[Cache] Saved clips â†’ {p.name}")
+    except Exception as e:
+        print(f"[Cache] âš  Could not save clips: {e}")
+
+
+def clear_cache(url: str) -> None:
+    """Remove all cached data for a URL."""
+    for suffix in ("signals", "clips"):
+        p = _cache_path(url, suffix)
+        p.unlink(missing_ok=True)
+    print(f"[Cache] Cleared cache for key {_url_key(url)}")
+
+
+def cache_exists(url: str) -> bool:
+    """Return True if any cached data exists for the URL."""
+    return (
+        _cache_path(url, "signals").exists()
+        or _cache_path(url, "clips").exists()
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI utility
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        clear_cache(sys.argv[1])
+        print("Cache cleared.")
+    else:
+        files = list(CACHE_DIR.glob("*.json"))
+        print(f"Cache directory: {CACHE_DIR}")
+        print(f"Cached entries:  {len(files)}")
+        for f in files:
+            size = f.stat().st_size
+            mtime = time.ctime(f.stat().st_mtime)
+            print(f"  {f.name}  ({size} bytes, {mtime})")
+
+
+=== caption_engine.py ===
+"""
+caption_engine.py â€” ASS subtitle generation for GTA6 AI Content Factory
+Converts cue dicts into Advanced SubStation Alpha (.ass) subtitle files
+suitable for FFmpeg burning via -vf ass=file.ass.
+"""
+import re
+import textwrap
+from pathlib import Path
+from typing import List, Dict, Optional
+
+# ---------------------------------------------------------------------------
+# ASS colour constants (BGR hex, alpha = 00 = fully opaque)
+# ---------------------------------------------------------------------------
+WHITE   = "&H00FFFFFF"
+BLACK   = "&H00000000"
+YELLOW  = "&H0000FFFF"   # For word highlighting
+SHADOW  = "&H80000000"   # Semi-transparent black shadow
+OUTLINE = "&H00000000"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _seconds_to_ass(sec: float) -> str:
+    """Convert float seconds to ASS timestamp h:mm:ss.cc"""
+    sec = max(0.0, sec)
+    h   = int(sec // 3600)
+    m   = int((sec % 3600) // 60)
+    s   = int(sec % 60)
+    cs  = int(round((sec - int(sec)) * 100))
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _wrap_text(text: str, max_chars: int = 32) -> str:
+    """Word-wrap long lines to stay within the safe zone."""
+    lines = textwrap.wrap(text, width=max_chars)
+    return r"\N".join(lines)   # ASS uses \N for newlines
+
+
+def _escape_ass(text: str) -> str:
+    """Escape curly braces (ASS tag delimiters) in plain text."""
+    return text.replace("{", "\\{").replace("}", "\\}")
+
+
+# ---------------------------------------------------------------------------
+# ASS header factory
+# ---------------------------------------------------------------------------
+
+def _build_ass_header(
+    resolution_x: int = 1080,
+    resolution_y: int = 1920,
+    font_name: str = "Arial",
+    font_size: int = 68,
+    preset: str = "default",
+) -> str:
+    """Generate ASS [Script Info] + [V4+ Styles] header."""
+
+    # Adjust style per editing preset
+    if preset in ("comedy", "fail", "unexpected"):
+        bold        = -1
+        outline_px  = 4
+        shadow_px   = 3
+        primary_col = WHITE
+        outline_col = BLACK
+    elif preset == "action":
+        bold        = -1
+        outline_px  = 5
+        shadow_px   = 4
+        primary_col = YELLOW
+        outline_col = BLACK
+    elif preset == "cinematic":
+        bold        = 0
+        outline_px  = 3
+        shadow_px   = 2
+        primary_col = WHITE
+        outline_col = "&H80000000"
+    else:  # discovery / story / default
+        bold        = -1
+        outline_px  = 4
+        shadow_px   = 3
+        primary_col = WHITE
+        outline_col = BLACK
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {resolution_x}
+PlayResY: {resolution_y}
+ScaledBorderAndShadow: yes
+YCbCr Matrix: None
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{font_name},{font_size},{primary_col},{WHITE},{outline_col},{SHADOW},{bold},0,0,0,100,100,0,0,1,{outline_px},{shadow_px},2,60,60,120,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    return header
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def generate_ass_captions(
+    cues: List[Dict],
+    output_path: Path,
+    clip_start_sec: float,
+    clip_end_sec: float,
+    font_name: str = "Arial",
+    font_size: int = 68,
+    preset: str = "default",
+) -> bool:
+    """
+    Write an ASS subtitle file for a clip time range.
+
+    Args:
+        cues:          List of {"start": float, "end": float, "text": str}
+        output_path:   Where to save the .ass file
+        clip_start_sec: Clip start in source seconds (cue times are relative to source)
+        clip_end_sec:   Clip end in source seconds
+        font_name:     Font family for captions
+        font_size:     Base font size (68 default for 1080x1920)
+        preset:        Editing preset name for styling
+
+    Returns:
+        True if file written successfully with at least one event line.
+    """
+    if not cues:
+        return False
+
+    # Filter cues that overlap with our clip window
+    clip_cues = [
+        c for c in cues
+        if c["end"] > clip_start_sec and c["start"] < clip_end_sec
+    ]
+
+    if not clip_cues:
+        return False
+
+    header   = _build_ass_header(1080, 1920, font_name, font_size, preset)
+    dialogue = []
+
+    for cue in clip_cues:
+        # Rebase timestamps to clip start (0 = beginning of clip)
+        rel_start = max(0.0, cue["start"] - clip_start_sec)
+        rel_end   = min(clip_end_sec - clip_start_sec, cue["end"] - clip_start_sec)
+        if rel_end <= rel_start:
+            continue
+
+        ass_start = _seconds_to_ass(rel_start)
+        ass_end   = _seconds_to_ass(rel_end)
+        text      = _wrap_text(_escape_ass(cue["text"]), max_chars=30)
+
+        dialogue.append(f"Dialogue: 0,{ass_start},{ass_end},Default,,0,0,0,,{text}")
+
+    if not dialogue:
+        return False
+
+    output_path.write_text(header + "\n".join(dialogue) + "\n", encoding="utf-8")
+    return True
+
+
+def generate_hook_ass(
+    hook_text: str,
+    output_path: Path,
+    display_duration: float = 3.5,
+    font_name: str = "Arial",
+    preset: str = "default",
+) -> bool:
+    """
+    Write an ASS file containing a single large hook overlay at the top of the clip.
+    Displayed for the first display_duration seconds.
+    """
+    # Choose style: hook always bold, large, contrasted
+    wrapped  = _wrap_text(hook_text.upper(), max_chars=22)
+    ass_hook = _escape_ass(wrapped)
+    # Build minimal ASS
+    content = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Hook,{font_name},82,{WHITE},{WHITE},{BLACK},{SHADOW},-1,0,0,0,100,100,2,0,1,5,4,8,60,60,180,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,{_seconds_to_ass(0.0)},{_seconds_to_ass(display_duration)},Hook,,0,0,0,,{ass_hook}
+"""
+    output_path.write_text(content, encoding="utf-8")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# CLI self-test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    test_cues = [
+        {"start": 10.0, "end": 13.5, "text": "Oh no, the police are coming!"},
+        {"start": 13.5, "end": 17.0, "text": "And he just runs straight into them!"},
+        {"start": 17.0, "end": 21.0, "text": "Five star wanted level already!"},
+    ]
+    out = Path("test_captions.ass")
+    ok  = generate_ass_captions(test_cues, out, 10.0, 25.0, preset="comedy")
+    print(f"Caption file written: {ok} â†’ {out}")
+    print(out.read_text())
+
+
+=== clipper.py ===
+"""
+clipper.py â€” Video download, rendering, and editing for GTA6 AI Content Factory
+Renders 1080x1920 (9:16) vertical Shorts with:
+  - 50/50 split-screen (facecam detected) or blurred fallback
+  - Four editing presets: comedy, action, cinematic, discovery
+  - ASS caption burning
+  - Audio loudness normalization
+  - Hook text overlay via textfile (safe for all Unicode/special chars)
+"""
+import re
+import shutil
+import subprocess
+import tempfile
+import urllib.request
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+
+from config import (
+    COOKIES_FILE, WORK_DIR, OUTPUT_DIR, FONT_PATH,
+    AUDIO_LOUDNESS_TARGET, AUDIO_TRUE_PEAK_TARGET,
+)
+from extractor import get_yt_dlp_base, seconds_to_hms
+from caption_engine import generate_ass_captions
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+YUNET_URL  = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+YUNET_PATH = WORK_DIR / "face_detection_yunet_2023mar.onnx"
+
+# Editing preset â†’ FFmpeg style parameters
+PRESET_STYLES = {
+    "comedy": {
+        "crf": "21",
+        "preset": "fast",
+        "saturation": 1.1,
+        "contrast": 1.05,
+    },
+    "action": {
+        "crf": "20",
+        "preset": "fast",
+        "saturation": 1.2,
+        "contrast": 1.1,
+    },
+    "cinematic": {
+        "crf": "18",
+        "preset": "slow",
+        "saturation": 0.95,
+        "contrast": 1.0,
+    },
+    "discovery": {
+        "crf": "21",
+        "preset": "fast",
+        "saturation": 1.05,
+        "contrast": 1.05,
+    },
+    "default": {
+        "crf": "22",
+        "preset": "veryfast",
+        "saturation": 1.0,
+        "contrast": 1.0,
+    },
+}
+
+# Map analyzer category â†’ editing preset
+CATEGORY_TO_PRESET = {
+    "comedy":     "comedy",
+    "fail":       "comedy",
+    "unexpected": "comedy",
+    "action":     "action",
+    "cinematic":  "cinematic",
+    "discovery":  "discovery",
+    "story":      "discovery",
+}
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def get_ffmpeg_exe() -> str:
+    ff = shutil.which("ffmpeg")
+    if ff:
+        return ff
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    return "ffmpeg"
+
+
+def sanitize_filename(name: str) -> str:
+    cleaned = re.sub(r'[\\/*?:"<>|]+', "", name).strip()
+    return cleaned[:55] or "viral_clip"
+
+
+def _write_text_file(text: str, tmp_dir: Path) -> Path:
+    """Write hook text to a temp UTF-8 file for FFmpeg textfile= filter."""
+    p = tmp_dir / "hook_text.txt"
+    p.write_text(text.upper(), encoding="utf-8")
+    return p
+
+
+def _probe_duration(video_path: Path) -> float:
+    """Return video duration in seconds using ffprobe."""
+    ff_probe = shutil.which("ffprobe") or "ffprobe"
+    try:
+        result = subprocess.run(
+            [
+                ff_probe, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True, text=True, timeout=15
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# YuNet face detection
+# ---------------------------------------------------------------------------
+
+def get_yunet_detector(w: int, h: int):
+    if not YUNET_PATH.exists():
+        print("[Clipper] Downloading YuNet face detection model...")
+        urllib.request.urlretrieve(YUNET_URL, YUNET_PATH)
+    return cv2.FaceDetectorYN.create(str(YUNET_PATH), "", (w, h), 0.75, 0.3, 5000)
+
+
+def detect_facecam_corner(video_path: Path) -> Optional[str]:
+    """
+    Sample 5 frames and test all 4 corners for a streamer facecam.
+    Returns the corner name if detected with â‰¥2/5 frame confidence, else None.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if total_frames <= 0 or width <= 0 or height <= 0:
+        cap.release()
+        return None
+
+    cw, ch   = int(width * 0.35), int(height * 0.42)
+    detector = get_yunet_detector(cw, ch)
+    corners  = {
+        "top-left":     (0,          0,           cw,     ch),
+        "top-right":    (width - cw, 0,           width,  ch),
+        "bottom-left":  (0,          height - ch, cw,     height),
+        "bottom-right": (width - cw, height - ch, width,  height),
+    }
+    scores = {k: 0 for k in corners}
+
+    for p in (0.15, 0.35, 0.55, 0.75, 0.90):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * p))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        for name, (x1, y1, x2, y2) in corners.items():
+            roi = frame[y1:y2, x1:x2]
+            _, faces = detector.detect(roi)
+            if faces is not None and len(faces) > 0:
+                scores[name] += 1
+
+    cap.release()
+    best_corner, best_hits = max(scores.items(), key=lambda x: x[1])
+    return best_corner if best_hits >= 2 else None
+
+
+# ---------------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------------
+
+def download_clip_slice(url: str, start_hms: str, end_hms: str, raw_path: Path) -> bool:
+    """Download only the [start_hms, end_hms] slice from a YouTube URL."""
+    raw_path.unlink(missing_ok=True)
+    section_arg = f"*{start_hms}-{end_hms}"
+    ff_exe  = get_ffmpeg_exe()
+    ff_args = ["--ffmpeg-location", ff_exe] if ff_exe != "ffmpeg" else []
+
+    cmd = get_yt_dlp_base() + ff_args + [
+        "--download-sections", section_arg,
+        "--force-keyframes-at-cuts",
+        "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "-o", str(raw_path),
+        url,
+    ]
+    print(f"[Clipper] Downloading slice {start_hms} â†’ {end_hms}...")
+    res = subprocess.run(cmd, check=False)
+    ok  = res.returncode == 0 and raw_path.exists() and raw_path.stat().st_size > 10_000
+    if not ok:
+        print(f"[Clipper] âš  Download failed for slice {start_hms} â†’ {end_hms}")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def _build_eq_filter(sat: float, contrast: float) -> str:
+    """Build an eq= filter string for colour grading."""
+    return f"eq=saturation={sat:.2f}:contrast={contrast:.2f}"
+
+
+def render_vertical_short(
+    raw_path: Path,
+    out_path: Path,
+    hook_text: str,
+    corner: Optional[str],
+    cues: List[Dict],
+    clip_start_sec: float,
+    clip_end_sec: float,
+    preset: str = "default",
+) -> bool:
+    """
+    Render a 1080x1920 vertical Short with:
+    - Facecam split-screen (top 960px cam / bottom 960px gameplay) if corner detected
+    - Blurred background + centered gameplay if no facecam
+    - ASS caption burn-in
+    - Hook text overlay using textfile (safe for special chars)
+    - Audio loudness normalization
+    - Preset-driven colour grading
+    """
+    ff_exe  = get_ffmpeg_exe()
+    style   = PRESET_STYLES.get(preset, PRESET_STYLES["default"])
+    eq_filt = _build_eq_filter(style["saturation"], style["contrast"])
+
+    with tempfile.TemporaryDirectory(prefix="gta6_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # --- Generate ASS caption file ---
+        ass_path  = tmp_path / "captions.ass"
+        from config import FONT_PATH as CFG_FONT
+        font_name = Path(CFG_FONT).stem if Path(CFG_FONT).exists() else "Arial"
+        has_caps  = generate_ass_captions(
+            cues, ass_path, clip_start_sec, clip_end_sec, font_name, 68, preset
+        )
+
+        # --- Write hook text file (safe for Unicode / apostrophes) ---
+        hook_file = _write_text_file(hook_text, tmp_path)
+
+        # --- Decide hook Y position ---
+        hook_y = "915" if corner else "240"
+
+        # --- Font path for drawtext ---
+        font_path_safe = str(FONT_PATH).replace("\\", "/").replace(":", "\\:")
+
+        # --- Build drawtext filter using textfile ---
+        drawtext = (
+            f"drawtext=textfile='{hook_file.as_posix()}':"
+            f"fontfile='{font_path_safe}':"
+            f"fontcolor=white:fontsize=58:"
+            f"box=1:boxcolor=black@0.80:boxborderw=16:"
+            f"x=(w-text_w)/2:y={hook_y}:"
+            f"fix_bounds=1"
+        )
+
+        # --- ASS filter ---
+        ass_filter = f"ass='{ass_path.as_posix()}'" if has_caps else ""
+
+        # --- Build filter_complex ---
+        if corner:
+            cam_crop_map = {
+                "top-left":     "crop=iw*0.34:ih*0.48:0:0",
+                "top-right":    "crop=iw*0.34:ih*0.48:iw*0.66:0",
+                "bottom-left":  "crop=iw*0.34:ih*0.48:0:ih*0.52",
+                "bottom-right": "crop=iw*0.34:ih*0.48:iw*0.66:ih*0.52",
+            }
+            cam_crop = cam_crop_map[corner]
+
+            # Overlay chain: cam top, game bottom, then caption, then hook
+            after_vstack = "[stacked]"
+            filter_parts = [
+                f"[0:v]{cam_crop},{eq_filt},scale=1080:960:force_original_aspect_ratio=increase,"
+                f"crop=1080:960,setsar=1[cam]",
+                f"[0:v]crop=ih*9/8:ih:(iw-ih*9/8)/2:0,{eq_filt},scale=1080:960,setsar=1[game]",
+                f"[cam][game]vstack=inputs=2{after_vstack}",
+            ]
+            last_label = "stacked"
+        else:
+            filter_parts = [
+                f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+                f"crop=1080:1920,boxblur=25:10,{eq_filt},eq=brightness=-0.12[bg]",
+                f"[0:v]{eq_filt},scale=1080:-2[fg]",
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2[comp]",
+            ]
+            last_label = "comp"
+
+        # Apply ASS captions if available
+        if ass_filter:
+            filter_parts.append(f"[{last_label}]{ass_filter}[captioned]")
+            last_label = "captioned"
+
+        # Apply hook drawtext
+        filter_parts.append(f"[{last_label}]{drawtext}[outv]")
+
+        filter_complex = ";\n".join(filter_parts)
+
+        # --- Audio normalization using loudnorm ---
+        audio_filter = (
+            f"loudnorm=I={AUDIO_LOUDNESS_TARGET}:"
+            f"TP={AUDIO_TRUE_PEAK_TARGET}:LRA=11"
+        )
+
+        # --- Full FFmpeg command ---
+        cmd = [
+            ff_exe, "-y",
+            "-i", str(raw_path),
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-map", "0:a?",
+            "-af", audio_filter,
+            "-c:v", "libx264",
+            "-preset", style["preset"],
+            "-crf", style["crf"],
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ar", "48000",
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            str(out_path),
+        ]
+
+        print(f"[Clipper] Rendering {preset.upper()} preset â†’ {out_path.name}...")
+        res = subprocess.run(cmd, check=False)
+
+        if res.returncode != 0 or not out_path.exists():
+            # Fallback: try without ASS captions (sometimes ffmpeg chokes on font paths)
+            print("[Clipper] âš  Primary render failed. Retrying without captions...")
+            if corner:
+                filter_simple = (
+                    f"[0:v]{cam_crop_map[corner]},{eq_filt},scale=1080:960:force_original_aspect_ratio=increase,"
+                    f"crop=1080:960,setsar=1[cam];"
+                    f"[0:v]crop=ih*9/8:ih:(iw-ih*9/8)/2:0,{eq_filt},scale=1080:960,setsar=1[game];"
+                    f"[cam][game]vstack=inputs=2[outv]"
+                )
+            else:
+                filter_simple = (
+                    f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+                    f"crop=1080:1920,boxblur=25:10,eq=brightness=-0.12[bg];"
+                    f"[0:v]scale=1080:-2[fg];"
+                    f"[bg][fg]overlay=(W-w)/2:(H-h)/2[outv]"
+                )
+            cmd_fallback = [
+                ff_exe, "-y",
+                "-i", str(raw_path),
+                "-filter_complex", filter_simple,
+                "-map", "[outv]",
+                "-map", "0:a?",
+                "-af", audio_filter,
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "22",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-pix_fmt", "yuv420p",
+                str(out_path),
+            ]
+            res = subprocess.run(cmd_fallback, check=False)
+
+        return res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 10_000
+
+
+# ---------------------------------------------------------------------------
+# Main build orchestrator
+# ---------------------------------------------------------------------------
+
+def build_clips(
+    url: str,
+    clips: List[Dict],
+    cues: List[Dict],
+    top_n: int = 3,
+) -> List[Dict]:
+    """
+    Download and render the top_n clips from the analyzer output.
+
+    Args:
+        url:   Source YouTube URL
+        clips: List of clip dicts from analyzer.find_viral_clips()
+        cues:  List of subtitle cues from extractor (for caption burn-in)
+        top_n: Maximum number of clips to build
+
+    Returns:
+        List of dicts describing each built clip (path, metadata, success)
+    """
+    ranked    = sorted(clips, key=lambda c: c.get("virality_score", 0), reverse=True)[:top_n]
+    generated = []
+
+    for idx, clip in enumerate(ranked, 1):
+        raw_file   = WORK_DIR / f"raw_slice_{idx}.mp4"
+        safe_title = sanitize_filename(clip["title"])
+        category   = clip.get("category", "default").lower()
+        preset     = CATEGORY_TO_PRESET.get(category, "default")
+        final_file = OUTPUT_DIR / f"clip_{idx:02d}_{preset}_{safe_title}.mp4"
+
+        start_hms = clip.get("start_hms") or seconds_to_hms(clip["start_sec"])
+        end_hms   = clip.get("end_hms")   or seconds_to_hms(clip["end_sec"])
+
+        # Download
+        if not download_clip_slice(url, start_hms, end_hms, raw_file):
+            print(f"[Clipper] âœ— Clip #{idx} download failed â€” skipping.")
+            generated.append({"index": idx, "success": False, "clip": clip})
+            continue
+
+        # Detect facecam
+        corner       = detect_facecam_corner(raw_file)
+        layout_label = f"50/50 Split (Facecam: {corner})" if corner else "Blurred 9:16 Fallback"
+        print(f"[Clipper] Layout â†’ {layout_label} | Preset â†’ {preset.upper()}")
+
+        # Render
+        success = render_vertical_short(
+            raw_path       = raw_file,
+            out_path       = final_file,
+            hook_text      = clip.get("hook_overlay", clip["title"]),
+            corner         = corner,
+            cues           = cues,
+            clip_start_sec = clip["start_sec"],
+            clip_end_sec   = clip["end_sec"],
+            preset         = preset,
+        )
+
+        if success:
+            print(f"[Clipper] âœ“ Saved â†’ {final_file}")
+            generated.append({
+                "index":   idx,
+                "success": True,
+                "path":    str(final_file),
+                "clip":    clip,
+                "preset":  preset,
+                "layout":  layout_label,
+            })
+        else:
+            print(f"[Clipper] âœ— Render failed for clip #{idx}")
+            generated.append({"index": idx, "success": False, "clip": clip})
+
+        raw_file.unlink(missing_ok=True)
+
+    return generated
+
+
+# ---------------------------------------------------------------------------
+# CLI self-test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    test_url   = "https://www.youtube.com/watch?v=qMafmHDMufw"
+    sample_clip = [{
+        "title":        "Speed Reacts To Iconic Lamar Roast Scene",
+        "hook_overlay": "SPEED CAN'T HANDLE THIS",
+        "start_hms":    "00:21:12",
+        "end_hms":      "00:21:50",
+        "start_sec":    1272.0,
+        "end_sec":      1310.0,
+        "virality_score": 98,
+        "category":     "comedy",
+    }]
+    outputs = build_clips(test_url, sample_clip, cues=[], top_n=1)
+    print("\n=== RENDER COMPLETE ===", outputs)
+
+=== config.py ===
+"""
+config.py â€” Central configuration for GTA6 AI Content Factory
+All secrets come from .env â€” never hardcoded here.
+"""
+import os
+import platform
+import shutil
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Directories
+# ---------------------------------------------------------------------------
+BASE_DIR   = Path(__file__).resolve().parent
+WORK_DIR   = BASE_DIR / "workspace"
+CACHE_DIR  = BASE_DIR / "cache"
+OUTPUT_DIR = BASE_DIR / "output_clips"
+LOGS_DIR   = BASE_DIR / "logs"
+
+for _d in (WORK_DIR, CACHE_DIR, OUTPUT_DIR, LOGS_DIR):
+    _d.mkdir(exist_ok=True)
+
+COOKIES_FILE = BASE_DIR / "cookies.txt"
+
+# ---------------------------------------------------------------------------
+# Gemini Configuration
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+_env_models = os.getenv("GEMINI_MODELS", "").strip()
+GEMINI_MODELS = (
+    [m.strip() for m in _env_models.split(",") if m.strip()]
+    if _env_models
+    else [
+        # Confirmed available via client.models.list() on this API key
+        "gemini-3.8-flash",        # Latest, fastest â€” primary choice
+        "gemini-3.6-flash",        # Fallback 1
+        "gemini-3.5-flash",        # Fallback 2
+        "gemini-3.5-flash-lite",   # Fallback 3 (smaller, cheaper)
+        "gemini-3.1-flash-lite",   # Fallback 4
+        "gemini-2.5-flash",        # Fallback 5
+        "gemini-2.5-flash-lite",   # Fallback 6
+    ]
+)
+GEMINI_MAX_RETRIES  = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
+GEMINI_BACKOFF_SEC  = float(os.getenv("GEMINI_BACKOFF_SEC", "2.0"))
+GEMINI_TEMPERATURE  = float(os.getenv("GEMINI_TEMPERATURE", "0.4"))
+
+# ---------------------------------------------------------------------------
+# Clip Validation Constraints
+# ---------------------------------------------------------------------------
+MIN_CLIP_DURATION = float(os.getenv("MIN_CLIP_DURATION", "25.0"))
+MAX_CLIP_DURATION = float(os.getenv("MAX_CLIP_DURATION", "58.0"))
+
+# ---------------------------------------------------------------------------
+# Telegram Bot (optional)
+# ---------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_ALLOWED_USER = os.getenv("TELEGRAM_ALLOWED_USER", "")
+
+# ---------------------------------------------------------------------------
+# GitHub Actions (optional)
+# ---------------------------------------------------------------------------
+GITHUB_TOKEN      = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "")
+GITHUB_REPO_NAME  = os.getenv("GITHUB_REPO_NAME", "gta6-clipper")
+
+# ---------------------------------------------------------------------------
+# YouTube Publishing (optional)
+# ---------------------------------------------------------------------------
+YT_CLIENT_SECRETS = BASE_DIR / "credentials.json"
+YT_TOKEN_FILE     = BASE_DIR / "token.json"
+
+# ---------------------------------------------------------------------------
+# Font Discovery (Windows + Linux compatible)
+# ---------------------------------------------------------------------------
+def find_font() -> str:
+    """Auto-detect a bold font path suitable for FFmpeg drawtext / ASS."""
+    system = platform.system()
+    candidates = []
+    if system == "Windows":
+        win_fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+        candidates = [
+            win_fonts / "arialbd.ttf",   # Arial Bold
+            win_fonts / "arial.ttf",
+            win_fonts / "impact.ttf",
+            win_fonts / "verdanab.ttf",
+        ]
+    else:
+        candidates = [
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+            Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+            Path("/usr/share/fonts/truetype/ubuntu/Ubuntu-Bold.ttf"),
+            Path("/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
+        ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    # Last resort: ask fontconfig
+    fc = shutil.which("fc-match")
+    if fc:
+        import subprocess
+        try:
+            result = subprocess.run(
+                [fc, "--format=%{file}", ":weight=bold"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+    return "Arial"   # FFmpeg built-in fallback
+
+FONT_PATH = find_font()
+
+# ---------------------------------------------------------------------------
+# Audio normalization targets
+# ---------------------------------------------------------------------------
+AUDIO_LOUDNESS_TARGET  = float(os.getenv("AUDIO_LOUDNESS_TARGET",  "-14.0"))   # LUFS
+AUDIO_TRUE_PEAK_TARGET = float(os.getenv("AUDIO_TRUE_PEAK_TARGET", "-1.0"))    # dBTP
+
+# ---------------------------------------------------------------------------
+# Debug / logging
+# ---------------------------------------------------------------------------
+DEBUG = os.getenv("DEBUG", "0").strip().lower() in ("1", "true", "yes")
+
+=== extractor.py ===
+"""
+extractor.py â€” Signal extraction for GTA6 AI Content Factory
+Fetches: metadata, YouTube Most Replayed heatmap, English subtitles/auto-captions,
+         live chat replay, hype keyword analysis.
+All timestamps are standardized to floating-point seconds throughout.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional
+from config import COOKIES_FILE, WORK_DIR
+
+HYPE_PATTERN = re.compile(
+    r"\b(w+|l+|lol+|lmao+|lmfao+|wtf+|omg+|no way|clip|insane|crazy|goat|sheesh|cooked|wild|rip|gg+)\b|[ðŸ”¥ðŸ’€ðŸ˜‚ðŸ˜­ðŸ¤¯ðŸ˜±ðŸš€]",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Utility: timestamp conversions
+# ---------------------------------------------------------------------------
+
+def hms_to_seconds(hms: str) -> float:
+    """Convert HH:MM:SS.mmm, MM:SS.mmm, or bare seconds string to float seconds."""
+    hms = hms.strip().replace(",", ".")
+    parts = [float(p) for p in hms.split(":")]
+    if len(parts) == 3:
+        return round(parts[0] * 3600 + parts[1] * 60 + parts[2], 3)
+    if len(parts) == 2:
+        return round(parts[0] * 60 + parts[1], 3)
+    return round(parts[0], 3)
+
+
+def seconds_to_hms(sec: float) -> str:
+    """Convert float seconds to HH:MM:SS (no milliseconds)."""
+    sec = max(0.0, sec)
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# ---------------------------------------------------------------------------
+# yt-dlp base command builder
+# ---------------------------------------------------------------------------
+
+def _find_ytdlp() -> List[str]:
+    """
+    Find the yt-dlp executable, checking in order:
+    1. Same venv as the running Python (venv/Scripts/yt-dlp.exe on Windows)
+    2. System PATH
+    3. Fall back to 'python -m yt_dlp' using the current interpreter
+    """
+    import shutil
+    # 1. Look for yt-dlp.exe next to current Python interpreter
+    scripts_dir = Path(sys.executable).parent
+    for name in ("yt-dlp.exe", "yt-dlp"):
+        candidate = scripts_dir / name
+        if candidate.exists():
+            return [str(candidate)]
+    # 2. System PATH
+    on_path = shutil.which("yt-dlp")
+    if on_path:
+        return [on_path]
+    # 3. Module fallback
+    return [sys.executable, "-m", "yt_dlp"]
+
+
+def get_yt_dlp_base() -> List[str]:
+    """Return the yt-dlp base command, adding cookie support when available."""
+    cmd = _find_ytdlp() + ["--no-warnings", "--no-playlist"]
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 10:
+        cmd.extend(["--cookies", str(COOKIES_FILE)])
+    return cmd
+
+
+# ---------------------------------------------------------------------------
+# VTT Parsing helpers
+# ---------------------------------------------------------------------------
+
+def _strip_rolling_overlap(prev_text: str, curr_text: str) -> str:
+    """Remove overlapping prefix words from YouTube rolling auto-captions."""
+    prev_words = prev_text.split()
+    curr_words = curr_text.split()
+    max_overlap = min(len(prev_words), len(curr_words))
+    for k in range(max_overlap, 0, -1):
+        if [w.lower() for w in prev_words[-k:]] == [w.lower() for w in curr_words[:k]]:
+            remainder = " ".join(curr_words[k:]).strip()
+            return remainder
+    return curr_text
+
+
+def parse_vtt_dedup(vtt_path) -> List[Dict]:
+    """
+    Parse a WebVTT subtitle file into chronological, deduplicated cues.
+    Returns: [{"start": float, "end": float, "text": str}, ...]
+
+    Handles:
+    - Both Path objects and string paths
+    - Exact duplicate removal
+    - Overlapping phrase removal (rolling captions)
+    - HTML tag stripping
+    - Chronological ordering
+    """
+    if vtt_path is None:
+        return []
+    vtt_path = Path(vtt_path)
+    if not vtt_path.exists():
+        return []
+
+    raw_lines = vtt_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    time_re = re.compile(
+        r"(\d{2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3})\s-->\s(\d{2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3})"
+    )
+
+    raw_cues: List[Dict] = []
+    curr_s: Optional[float] = None
+    curr_e: Optional[float] = None
+    curr_txt: List[str] = []
+
+    def _flush():
+        nonlocal curr_s, curr_e, curr_txt
+        if curr_s is not None and curr_e is not None and curr_txt:
+            # Strip HTML tags (timing tags, colour tags, etc.)
+            joined = " ".join(curr_txt)
+            cleaned = re.sub(r"<[^>]+>", "", joined)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned:
+                raw_cues.append({"start": curr_s, "end": curr_e, "text": cleaned})
+
+    for line in raw_lines:
+        stripped = line.strip()
+        m = time_re.search(stripped)
+        if m:
+            _flush()
+            curr_s = hms_to_seconds(m.group(1))
+            curr_e = hms_to_seconds(m.group(2))
+            curr_txt = []
+        elif (
+            stripped
+            and not stripped.startswith(("WEBVTT", "Kind:", "Language:", "NOTE", "STYLE", "REGION"))
+            and not stripped.isdigit()
+        ):
+            curr_txt.append(stripped)
+
+    _flush()
+    raw_cues.sort(key=lambda c: c["start"])
+
+    # Deduplication pass
+    deduped: List[Dict] = []
+    last_full_text = ""
+    for cue in raw_cues:
+        text = cue["text"]
+        # Skip exact duplicates
+        if text.lower() == last_full_text.lower():
+            continue
+        # Strip rolling overlap
+        trimmed = _strip_rolling_overlap(last_full_text, text)
+        last_full_text = text
+        if trimmed:
+            deduped.append({"start": cue["start"], "end": cue["end"], "text": trimmed})
+
+    return deduped
+
+
+def _pick_best_vtt(vtt_files: List[Path]) -> Optional[Path]:
+    """Prefer manual English subtitles over auto-generated tracks."""
+    if not vtt_files:
+        return None
+    # Priority: en-orig > .en. > first found
+    for f in vtt_files:
+        if ".en-orig." in f.name:
+            return f
+    for f in vtt_files:
+        if re.search(r"\.en[.-]", f.name):
+            return f
+    return vtt_files[0]
+
+
+# ---------------------------------------------------------------------------
+# Main extraction entry point
+# ---------------------------------------------------------------------------
+
+def fetch_video_signals(url: str) -> Dict:
+    """
+    Download metadata, heatmap, English subtitles, and live chat for a YouTube URL.
+    Returns a signals dict with all timestamps as float seconds.
+    """
+    # Clean up old workspace files
+    for old in WORK_DIR.glob("target*"):
+        old.unlink(missing_ok=True)
+
+    out_template = str(WORK_DIR / "target")
+    cmd = get_yt_dlp_base() + [
+        "--skip-download",
+        "--ignore-no-formats-error",
+        "--write-info-json",
+        "--write-sub",
+        "--write-auto-sub",
+        "--sub-langs", "en-orig,en.*,en,live_chat",
+        "--sub-format", "vtt/json",
+        "-o", out_template,
+        url,
+    ]
+    print("[Extractor] Fetching metadata, transcript, and live chat replay...")
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    subprocess.run(cmd, check=False, capture_output=False, env=env)
+
+    # ------------------------------------------------------------------ #
+    # 1. Info JSON  â†’  title, duration, heatmap peaks                     #
+    # ------------------------------------------------------------------ #
+    info_files = list(WORK_DIR.glob("target*.info.json"))
+    title        = "Gaming VOD"
+    video_id     = ""
+    duration_sec = 0.0
+    heatmap_peaks: List[Dict] = []
+
+    if info_files:
+        try:
+            info = json.loads(info_files[0].read_text(encoding="utf-8", errors="ignore"))
+            title        = info.get("title", title)
+            video_id     = info.get("id", "")
+            duration_sec = float(info.get("duration") or 0.0)
+            for entry in info.get("heatmap") or []:
+                val = float(entry.get("value", 0.0))
+                if val >= 0.60:   # lowered threshold to get more peaks
+                    heatmap_peaks.append({
+                        "start_sec":  round(float(entry.get("start_time", 0.0)), 2),
+                        "end_sec":    round(float(entry.get("end_time", 0.0)), 2),
+                        "intensity":  round(val, 3),
+                    })
+            heatmap_peaks.sort(key=lambda x: x["intensity"], reverse=True)
+        except Exception as e:
+            print(f"[Extractor] Warning: could not parse info.json â€” {e}")
+
+    # ------------------------------------------------------------------ #
+    # 2. Live Chat Replay JSON  â†’  10-second float-keyed buckets          #
+    # ------------------------------------------------------------------ #
+    chat_files = list(WORK_DIR.glob("target*.live_chat.json"))
+    chat_spikes: List[Dict] = []
+
+    if chat_files:
+        print("[Extractor] Analysing live chat replay velocity...")
+        buckets: Dict = defaultdict(lambda: {"count": 0, "hype": 0, "samples": []})
+        try:
+            with chat_files[0].open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    try:
+                        data   = json.loads(line)
+                        action = data.get("replayChatItemAction", {})
+                        offset_ms = int(action.get("videoOffsetTimeMsec", -1))
+                        if offset_ms < 0:
+                            continue
+                        bucket_sec = float(int((offset_ms / 1000.0) // 10) * 10)
+                        for act in action.get("actions", []):
+                            item     = act.get("addChatItemAction", {}).get("item", {})
+                            renderer = item.get("liveChatTextMessageRenderer", {})
+                            runs     = renderer.get("message", {}).get("runs", [])
+                            msg      = "".join(r.get("text", "") for r in runs).strip()
+                            if not msg:
+                                continue
+                            buckets[bucket_sec]["count"] += 1
+                            if HYPE_PATTERN.search(msg):
+                                buckets[bucket_sec]["hype"] += 1
+                            if len(buckets[bucket_sec]["samples"]) < 4:
+                                buckets[bucket_sec]["samples"].append(msg[:50])
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"[Extractor] Warning: could not parse live chat â€” {e}")
+
+        for b_sec, stats in buckets.items():
+            chat_spikes.append({
+                "start_sec":    b_sec,
+                "msgs_in_10s":  stats["count"],
+                "hype_msgs":    stats["hype"],
+                "score":        stats["count"] + (stats["hype"] * 2),
+                "sample_chat":  " | ".join(stats["samples"]),
+            })
+        chat_spikes.sort(key=lambda x: x["score"], reverse=True)
+        chat_spikes = chat_spikes[:25]
+
+    # ------------------------------------------------------------------ #
+    # 3. Subtitles  â†’  deduplicated cue list                              #
+    # ------------------------------------------------------------------ #
+    vtt_files = list(WORK_DIR.glob("target*.vtt"))
+    best_vtt  = _pick_best_vtt(vtt_files)
+    cues      = parse_vtt_dedup(best_vtt) if best_vtt else []
+
+    if not cues:
+        print("[Extractor] No subtitles found â€” Gemini will analyze with heatmap/chat signals only.")
+    else:
+        print(f"[Extractor] Parsed {len(cues)} deduplicated subtitle cues.")
+
+    # Build the transcript block that Gemini expects: [123.4s] text
+    transcript_text = "\n".join(f"[{c['start']:.1f}s] {c['text']}" for c in cues)
+
+    return {
+        "url":            url,
+        "video_id":       video_id,
+        "title":          title,
+        "duration_sec":   duration_sec,
+        "heatmap_peaks":  heatmap_peaks[:25],
+        "chat_spikes":    chat_spikes,
+        "cues":           cues,
+        "transcript":     transcript_text,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI self-test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    test_url = input("Paste a YouTube gaming video/stream VOD URL to test: ").strip()
+    result   = fetch_video_signals(test_url)
+    print("\n=== EXTRACTION SUMMARY ===")
+    print(f"Title:          {result['title']} ({result['duration_sec']}s)")
+    print(f"Video ID:       {result['video_id']}")
+    print(f"Heatmap Peaks:  {len(result['heatmap_peaks'])} â†’ Top 3: {result['heatmap_peaks'][:3]}")
+    print(f"Chat Spikes:    {len(result['chat_spikes'])} â†’ Top 3: {result['chat_spikes'][:3]}")
+    print(f"Subtitle Cues:  {len(result['cues'])}")
+    print("Sample Transcript:\n" + "\n".join(result["transcript"].splitlines()[:8]))
+
+=== main.py ===
+"""
+main.py â€” Single-command entry point for GTA6 AI Content Factory
+
+Usage:
+  python main.py "YOUTUBE_URL" [options]
+
+Options:
+  --clips N      Number of clips to ask Gemini to find (default: 5)
+  --top N        Top N clips to actually download and render (default: 3)
+  --out DIR      Output directory (default: output_clips/)
+  --force        Clear cache and re-process from scratch
+  --no-cache     Same as --force (alias)
+  --debug        Enable verbose debug logging
+
+Example:
+  python main.py "https://www.youtube.com/watch?v=XXXX" --clips 7 --top 3 --out my_clips
+"""
+import argparse
+import sys
+from pipeline import run_pipeline
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="GTA6 AI Content Factory â€” Automated YouTube Shorts Generator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "url",
+        help="YouTube URL of the gaming VOD or stream to process",
+    )
+    parser.add_argument(
+        "--clips", type=int, default=5, metavar="N",
+        help="Number of viral moment candidates to ask Gemini to identify (default: 5)",
+    )
+    parser.add_argument(
+        "--top", type=int, default=3, metavar="N",
+        help="Number of top clips to download and render (default: 3)",
+    )
+    parser.add_argument(
+        "--out", type=str, default=None, metavar="DIR",
+        help="Output directory for rendered clips (default: output_clips/)",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Ignore cache and re-process from scratch",
+    )
+    parser.add_argument(
+        "--no-cache", dest="no_cache", action="store_true",
+        help="Alias for --force",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable verbose debug logging",
+    )
+
+    args = parser.parse_args()
+
+    print("=" * 56)
+    print("  GTA6 AI Content Factory  --  Shorts MVP")
+    print("=" * 56)
+
+    result = run_pipeline(
+        url       = args.url,
+        max_clips = args.clips,
+        top_n     = args.top,
+        out_dir   = args.out,
+        force     = args.force or args.no_cache,
+        debug     = args.debug,
+    )
+
+    # Print final summary
+    print(result.get("summary", ""))
+
+    # Exit code: 0 = success, 1 = no clips produced
+    if result.get("success") and result.get("clips_built", 0) > 0:
+        print(f"\nâœ… Done! {result['clips_built']} clip(s) ready for review.")
+        return 0
+    else:
+        print("\nâŒ Pipeline completed but no valid clips were produced.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+=== pipeline.py ===
+"""
+pipeline.py â€” Orchestration layer for GTA6 AI Content Factory
+Coordinates: extract â†’ cache â†’ analyze â†’ validate â†’ download â†’ render â†’ QC â†’ metadata
+"""
+import json
+import logging
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from config import (
+    OUTPUT_DIR, LOGS_DIR, MIN_CLIP_DURATION, MAX_CLIP_DURATION, DEBUG
+)
+
+logger = logging.getLogger("gta6_pipeline")
+
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+def setup_logging(debug: bool = False) -> None:
+    level    = logging.DEBUG if debug else logging.INFO
+    log_file = LOGS_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    logging.basicConfig(
+        level   = level,
+        format  = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file, encoding="utf-8"),
+        ],
+    )
+    logger.info(f"Log file: {log_file}")
+
+
+# ---------------------------------------------------------------------------
+# Metadata helper
+# ---------------------------------------------------------------------------
+
+def _save_metadata(clip: Dict, output_path: str, source_url: str, source_title: str, preset: str) -> Path:
+    """Write a metadata.json beside the rendered clip."""
+    meta = {
+        "source_url":        source_url,
+        "source_title":      source_title,
+        "source_video_id":   clip.get("video_id", ""),
+        "clip_start_sec":    clip.get("start_sec"),
+        "clip_end_sec":      clip.get("end_sec"),
+        "duration_sec":      clip.get("duration"),
+        "title":             clip.get("title"),
+        "hook_overlay":      clip.get("hook_overlay"),
+        "alternative_hooks": clip.get("alternative_hooks", []),
+        "description":       clip.get("description", ""),
+        "hashtags":          clip.get("hashtags", []),
+        "virality_score":    clip.get("virality_score"),
+        "confidence_score":  clip.get("confidence_score"),
+        "category":          clip.get("category"),
+        "editing_preset":    preset,
+        "output_path":       output_path,
+        "generated_at":      datetime.utcnow().isoformat() + "Z",
+        "rights_note":       (
+            "Uses authorized gameplay footage only. "
+            "Manual review required before publishing."
+        ),
+    }
+    out = Path(output_path)
+    meta_path = out.parent / (out.stem + ".json")
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return meta_path
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def run_pipeline(
+    url:       str,
+    max_clips: int = 5,
+    top_n:     int = 3,
+    out_dir:   Optional[str] = None,
+    force:     bool = False,
+    debug:     bool = False,
+) -> Dict:
+    """
+    Full end-to-end pipeline.
+
+    Returns:
+      {
+        "success":    bool,
+        "clips_built": int,
+        "results":    [result_dict, ...],
+        "summary":    str,
+      }
+    """
+    setup_logging(debug)
+    t0 = time.time()
+
+    # Redirect output directory if specified
+    if out_dir:
+        from config import OUTPUT_DIR as _OD
+        import config as _cfg
+        _cfg.OUTPUT_DIR = Path(out_dir)
+        _cfg.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        # Also update clipper's OUTPUT_DIR reference
+        try:
+            import clipper as _clipper
+            _clipper.OUTPUT_DIR = _cfg.OUTPUT_DIR
+        except Exception:
+            pass
+
+    effective_out = Path(out_dir) if out_dir else OUTPUT_DIR
+
+    # ------------------------------------------------------------------ #
+    # Step 1: Validate URL                                                 #
+    # ------------------------------------------------------------------ #
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        return {"success": False, "clips_built": 0, "results": [], "summary": "Invalid URL"}
+
+    logger.info(f"=== GTA6 AI Content Factory â€” Pipeline Start ===")
+    logger.info(f"URL:        {url}")
+    logger.info(f"Max clips:  {max_clips} | Top N: {top_n} | Force: {force}")
+
+    # ------------------------------------------------------------------ #
+    # Step 2: Extract signals (or load from cache)                        #
+    # ------------------------------------------------------------------ #
+    from cache_manager import load_signals, save_signals, load_clips, save_clips, clear_cache
+    from extractor import fetch_video_signals
+
+    if force:
+        clear_cache(url)
+
+    signals = None
+    if not force:
+        signals = load_signals(url)
+
+    if signals is None:
+        logger.info("--- Step 2: Extracting signals from YouTube ---")
+        signals = fetch_video_signals(url)
+        save_signals(url, signals)
+    else:
+        logger.info("--- Step 2: Signals loaded from cache ---")
+
+    source_title = signals.get("title", "GTA VI Gaming VOD")
+    duration_sec = signals.get("duration_sec", 0.0)
+    logger.info(f"Title:      {source_title}")
+    logger.info(f"Duration:   {duration_sec:.0f}s | "
+                f"Heatmap peaks: {len(signals.get('heatmap_peaks', []))} | "
+                f"Cues: {len(signals.get('cues', []))}")
+
+    # ------------------------------------------------------------------ #
+    # Step 3: Gemini analysis (or load from cache)                        #
+    # ------------------------------------------------------------------ #
+    clips = None
+    if not force:
+        clips = load_clips(url)
+
+    if clips is None:
+        logger.info(f"--- Step 3: Analyzing with Gemini (asking for {max_clips} clips) ---")
+        from analyzer import find_viral_clips
+        try:
+            clips = find_viral_clips(signals, max_clips=max_clips)
+            save_clips(url, clips)
+        except Exception as e:
+            logger.error(f"Gemini analysis failed: {e}")
+            return {"success": False, "clips_built": 0, "results": [], "summary": str(e)}
+    else:
+        logger.info(f"--- Step 3: {len(clips)} clips loaded from Gemini cache ---")
+
+    if not clips:
+        msg = "No viral clips identified by Gemini."
+        logger.warning(msg)
+        return {"success": False, "clips_built": 0, "results": [], "summary": msg}
+
+    # Print analysis summary
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Gemini identified {len(clips)} candidate clips:")
+    for i, c in enumerate(clips, 1):
+        logger.info(
+            f"  #{i} [{c.get('start_hms','?')} â†’ {c.get('end_hms','?')} | "
+            f"{c.get('duration','?')}s | "
+            f"Score: {c.get('virality_score','?')}/100 | "
+            f"{c.get('category','?').upper()}] "
+            f"{c.get('title','?')}"
+        )
+    logger.info(f"{'='*60}\n")
+
+    # ------------------------------------------------------------------ #
+    # Step 4: Download + Render top_n clips                               #
+    # ------------------------------------------------------------------ #
+    logger.info(f"--- Step 4: Building top {top_n} clips ---")
+    from clipper import build_clips
+
+    cues   = signals.get("cues", [])
+    built  = build_clips(url, clips, cues, top_n=top_n)
+
+    # ------------------------------------------------------------------ #
+    # Step 5: Quality check                                                #
+    # ------------------------------------------------------------------ #
+    logger.info("--- Step 5: Running quality checks ---")
+    from quality_checker import check_video
+
+    final_results = []
+    for item in built:
+        if not item.get("success") or not item.get("path"):
+            final_results.append({**item, "qc": {"ok": False, "issues": ["Render failed"]}})
+            continue
+
+        path   = item["path"]
+        qc     = check_video(Path(path), MIN_CLIP_DURATION - 5, MAX_CLIP_DURATION + 7)
+        preset = item.get("preset", "default")
+        clip   = item["clip"]
+
+        if qc["ok"]:
+            # Save metadata JSON
+            meta_path = _save_metadata(clip, path, url, source_title, preset)
+            logger.info(f"âœ“ Clip #{item['index']} passed QC â†’ metadata: {meta_path.name}")
+        else:
+            logger.warning(f"âœ— Clip #{item['index']} FAILED QC: {qc['issues']}")
+
+        final_results.append({**item, "qc": qc})
+
+    # ------------------------------------------------------------------ #
+    # Step 6: Final summary                                                #
+    # ------------------------------------------------------------------ #
+    passed = [r for r in final_results if r.get("qc", {}).get("ok")]
+    failed = [r for r in final_results if not r.get("qc", {}).get("ok")]
+    elapsed = round(time.time() - t0, 1)
+
+    summary_lines = [
+        "",
+        "=" * 65,
+        f"  GTA6 AI Content Factory â€” Pipeline Complete ({elapsed}s)",
+        "=" * 65,
+        f"  Source:  {source_title}",
+        f"  URL:     {url[:60]}{'...' if len(url) > 60 else ''}",
+        f"  Result:  {len(passed)} clip(s) ready / {len(failed)} failed",
+        "-" * 65,
+    ]
+    for r in passed:
+        c   = r["clip"]
+        qc  = r.get("qc", {})
+        summary_lines.append(
+            f"  âœ“ #{r['index']:02d} | {c.get('category','?').upper():12} | "
+            f"{qc.get('duration', c.get('duration', '?'))}s | "
+            f"Score {c.get('virality_score','?'):3}/100 | "
+            f"{c.get('title','?')[:40]}"
+        )
+        summary_lines.append(f"       â†’ {r.get('path','?')}")
+    for r in failed:
+        c = r.get("clip", {})
+        issues = r.get("qc", {}).get("issues", [r.get("reason", "unknown error")])
+        summary_lines.append(f"  âœ— #{r['index']:02d} | FAILED | {c.get('title','?')[:40]}")
+        for iss in issues[:2]:
+            summary_lines.append(f"       â†’ {iss}")
+    summary_lines.append("=" * 65)
+
+    summary = "\n".join(summary_lines)
+    logger.info(summary)
+
+    return {
+        "success":     len(passed) > 0,
+        "clips_built": len(passed),
+        "results":     final_results,
+        "summary":     summary,
+        "elapsed_sec": elapsed,
+    }
+
+
+=== publisher.py ===
+"""
+publisher.py â€” Optional YouTube Shorts uploader for GTA6 AI Content Factory
+
+Requirements:
+  pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+
+Setup:
+  1. Go to Google Cloud Console â†’ enable YouTube Data API v3
+  2. Create OAuth 2.0 credentials (Desktop app)
+  3. Download credentials.json to project root
+  4. First run will open browser for auth â†’ saves token.json
+
+Usage:
+  python publisher.py output_clips/clip_01_comedy_Title.mp4 --privacy unlisted
+"""
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+try:
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    YOUTUBE_AVAILABLE = True
+except ImportError:
+    YOUTUBE_AVAILABLE = False
+
+from config import YT_CLIENT_SECRETS, YT_TOKEN_FILE
+
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+def _get_credentials():
+    """Get or refresh YouTube OAuth2 credentials."""
+    creds = None
+
+    if YT_TOKEN_FILE.exists():
+        creds = Credentials.from_authorized_user_file(str(YT_TOKEN_FILE), SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not YT_CLIENT_SECRETS.exists():
+                raise FileNotFoundError(
+                    f"credentials.json not found at {YT_CLIENT_SECRETS}. "
+                    "Download it from Google Cloud Console."
+                )
+            flow  = InstalledAppFlow.from_client_secrets_file(str(YT_CLIENT_SECRETS), SCOPES)
+            creds = flow.run_local_server(port=0)
+        YT_TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+
+    return creds
+
+
+# ---------------------------------------------------------------------------
+# Upload
+# ---------------------------------------------------------------------------
+
+def upload_short(
+    video_path: Path,
+    title: str,
+    description: str,
+    tags: list,
+    privacy: str = "unlisted",
+) -> Optional[str]:
+    """
+    Upload a video to YouTube as a Short.
+
+    Args:
+        video_path:  Path to the MP4 file
+        title:       Video title (max 100 chars)
+        description: Video description
+        tags:        List of tag strings (hashtags without #)
+        privacy:     "public", "unlisted", or "private"
+
+    Returns:
+        YouTube video ID on success, None on failure
+    """
+    if not YOUTUBE_AVAILABLE:
+        print("âŒ YouTube upload libraries not installed.")
+        print("   Run: pip install google-api-python-client google-auth-oauthlib")
+        return None
+
+    if not video_path.exists():
+        print(f"âŒ Video file not found: {video_path}")
+        return None
+
+    # Require manual approval before uploading
+    approval_marker = video_path.parent / (video_path.stem + ".approved")
+    if not approval_marker.exists():
+        print(
+            f"âš ï¸  Clip not approved for upload: {video_path.name}\n"
+            f"   Create {approval_marker.name} to approve, or use /approve N in Telegram."
+        )
+        return None
+
+    print(f"[Publisher] Authenticating with YouTube...")
+    try:
+        creds   = _get_credentials()
+        youtube = build("youtube", "v3", credentials=creds)
+    except Exception as e:
+        print(f"âŒ YouTube authentication failed: {e}")
+        return None
+
+    # Clean tags (remove # prefix, limit)
+    clean_tags = [t.lstrip("#") for t in tags][:500]
+
+    body = {
+        "snippet": {
+            "title":       title[:100],
+            "description": description[:5000],
+            "tags":        clean_tags,
+            "categoryId":  "20",   # Gaming
+        },
+        "status": {
+            "privacyStatus": privacy,
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+
+    media = MediaFileUpload(
+        str(video_path),
+        mimetype   = "video/mp4",
+        resumable  = True,
+        chunksize  = 1024 * 1024 * 5,  # 5 MB chunks
+    )
+
+    print(f"[Publisher] Uploading: {video_path.name}")
+    print(f"            Title:    {title}")
+    print(f"            Privacy:  {privacy}")
+
+    try:
+        request  = youtube.videos().insert(
+            part = "snippet,status",
+            body = body,
+            media_body = media,
+        )
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                print(f"            Progress: {int(status.progress() * 100)}%")
+
+        video_id = response.get("id")
+        print(f"[Publisher] âœ“ Uploaded! https://youtube.com/shorts/{video_id}")
+
+        # Save returned video ID next to clip
+        result_path = video_path.parent / (video_path.stem + ".upload.json")
+        result_path.write_text(
+            json.dumps({"video_id": video_id, "url": f"https://youtube.com/shorts/{video_id}"},
+                       indent=2),
+            encoding="utf-8"
+        )
+        return video_id
+
+    except Exception as e:
+        print(f"âŒ Upload failed: {e}")
+        return None
+
+
+def upload_approved_clips(out_dir: Path, privacy: str = "unlisted") -> None:
+    """Find all approved clips in out_dir and upload them."""
+    approved = [
+        f for f in out_dir.glob("*.mp4")
+        if (out_dir / (f.stem + ".approved")).exists()
+        and not (out_dir / (f.stem + ".upload.json")).exists()
+    ]
+
+    if not approved:
+        print("No approved clips awaiting upload.")
+        return
+
+    for video_path in approved:
+        # Try to load metadata
+        meta_path = video_path.parent / (video_path.stem + ".json")
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        else:
+            meta = {
+                "title":       video_path.stem,
+                "description": "#GTA6 #Shorts",
+                "hashtags":    ["#GTA6", "#Shorts"],
+            }
+
+        upload_short(
+            video_path  = video_path,
+            title       = meta.get("title", video_path.stem),
+            description = meta.get("description", "") + "\n\n" + " ".join(meta.get("hashtags", [])),
+            tags        = meta.get("hashtags", []),
+            privacy     = privacy,
+        )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Upload approved clips to YouTube Shorts")
+    parser.add_argument("path", nargs="?", help="Single clip to upload, or leave empty to upload all approved clips")
+    parser.add_argument("--privacy", default="unlisted", choices=["public", "unlisted", "private"])
+    parser.add_argument("--dir", default="output_clips", help="Directory to scan for approved clips")
+    args = parser.parse_args()
+
+    if args.path:
+        p = Path(args.path)
+        meta_p = p.parent / (p.stem + ".json")
+        meta   = json.loads(meta_p.read_text()) if meta_p.exists() else {}
+        upload_short(p, meta.get("title", p.stem), meta.get("description", ""), meta.get("hashtags", []), args.privacy)
+    else:
+        upload_approved_clips(Path(args.dir), args.privacy)
+
+
+=== quality_checker.py ===
+"""
+quality_checker.py â€” Output validation for GTA6 AI Content Factory
+Every rendered clip is checked before being accepted for review or upload.
+"""
+import json
+import subprocess
+import shutil
+from pathlib import Path
+from typing import Dict, Optional
+
+
+# ---------------------------------------------------------------------------
+# ffprobe helpers
+# ---------------------------------------------------------------------------
+
+def _ffprobe(path: Path) -> Optional[Dict]:
+    """Return ffprobe JSON output for a video file, or None on failure."""
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    try:
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                "-show_format",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def check_video(path: Path, min_duration: float = 20.0, max_duration: float = 65.0) -> Dict:
+    """
+    Validate a rendered clip.
+
+    Returns a dict:
+      {
+        "ok": bool,
+        "path": str,
+        "issues": [str, ...],
+        "width": int,
+        "height": int,
+        "duration": float,
+        "has_audio": bool,
+      }
+    """
+    result = {
+        "ok":        False,
+        "path":      str(path),
+        "issues":    [],
+        "width":     0,
+        "height":    0,
+        "duration":  0.0,
+        "has_audio": False,
+    }
+
+    # --- Basic file checks ---
+    if not path.exists():
+        result["issues"].append("File does not exist")
+        return result
+
+    if not path.is_file():
+        result["issues"].append("Path is not a file")
+        return result
+
+    size = path.stat().st_size
+    if size < 50_000:
+        result["issues"].append(f"File too small ({size} bytes) â€” likely corrupt or empty")
+        return result
+
+    # --- ffprobe analysis ---
+    probe = _ffprobe(path)
+    if not probe:
+        result["issues"].append("ffprobe failed â€” file may be unreadable or corrupt")
+        return result
+
+    streams = probe.get("streams", [])
+
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    if not video_stream:
+        result["issues"].append("No video stream found")
+        return result
+
+    # --- Resolution ---
+    width  = int(video_stream.get("width",  0))
+    height = int(video_stream.get("height", 0))
+    result["width"]  = width
+    result["height"] = height
+
+    if width != 1080 or height != 1920:
+        result["issues"].append(f"Wrong resolution: {width}x{height} (expected 1080x1920)")
+
+    # --- Aspect ratio ---
+    if width > 0 and height > 0:
+        ratio = height / width
+        if abs(ratio - (16 / 9)) > 0.05:
+            result["issues"].append(
+                f"Aspect ratio {width}:{height} = {ratio:.3f} (expected ~1.778 for 9:16)"
+            )
+
+    # --- Duration ---
+    fmt_duration = float(probe.get("format", {}).get("duration", 0) or 0)
+    result["duration"] = round(fmt_duration, 2)
+
+    if fmt_duration < min_duration:
+        result["issues"].append(
+            f"Duration too short: {fmt_duration:.1f}s (min {min_duration}s)"
+        )
+    if fmt_duration > max_duration:
+        result["issues"].append(
+            f"Duration too long: {fmt_duration:.1f}s (max {max_duration}s)"
+        )
+
+    # --- Audio ---
+    result["has_audio"] = audio_stream is not None
+    # We don't reject for missing audio (some clips might be silent gaming footage)
+    # but we flag it
+    if not audio_stream:
+        result["issues"].append("No audio stream â€” verify this is intentional")
+
+    # --- Determine overall pass/fail ---
+    # Only hard-fail on critical issues (resolution, duration, corrupt)
+    critical_keywords = [
+        "File does not exist",
+        "File too small",
+        "ffprobe failed",
+        "No video stream",
+        "Wrong resolution",
+        "Duration too short",
+        "Duration too long",
+    ]
+    hard_fails = [
+        issue for issue in result["issues"]
+        if any(kw in issue for kw in critical_keywords)
+    ]
+    result["ok"] = len(hard_fails) == 0
+
+    return result
+
+
+def check_clips(paths: list, min_duration: float = 20.0, max_duration: float = 65.0) -> Dict:
+    """
+    Validate a list of clip paths.
+
+    Returns:
+      {
+        "passed": [check_result, ...],
+        "failed": [check_result, ...],
+        "total":  int,
+      }
+    """
+    passed = []
+    failed = []
+
+    for p in paths:
+        r = check_video(Path(p), min_duration, max_duration)
+        if r["ok"]:
+            passed.append(r)
+            print(f"[QC] âœ“ PASS  {Path(p).name}  ({r['width']}x{r['height']}, {r['duration']:.1f}s)")
+        else:
+            failed.append(r)
+            print(f"[QC] âœ— FAIL  {Path(p).name}")
+            for issue in r["issues"]:
+                print(f"         â†³ {issue}")
+
+    return {"passed": passed, "failed": failed, "total": len(paths)}
+
+
+# ---------------------------------------------------------------------------
+# CLI self-test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+    targets = sys.argv[1:] if len(sys.argv) > 1 else list(Path("output_clips").glob("*.mp4"))
+    if not targets:
+        print("Usage: python quality_checker.py [video.mp4 ...]")
+    else:
+        summary = check_clips([str(t) for t in targets])
+        print(f"\n=== QC SUMMARY: {len(summary['passed'])}/{summary['total']} passed ===")
+
+
+=== requirements.txt ===
+# GTA6 AI Content Factory â€” Required Python packages
+# Install with: pip install -r requirements.txt
+
+# Core
+yt-dlp>=2024.11.4
+google-genai>=0.8.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+opencv-python>=4.8.0
+
+# Optional: faster-whisper for local audio transcription when no subtitles available
+# Uncomment if needed (requires CUDA or CPU-only build)
+# faster-whisper>=1.0.0
+
+# Optional: YouTube Data API for publishing
+# Uncomment to enable publishing
+# google-api-python-client>=2.0.0
+# google-auth-oauthlib>=1.0.0
+# google-auth-httplib2>=0.1.0
+
+# Optional: Telegram bot for mobile control
+# Uncomment to enable Telegram integration
+# python-telegram-bot>=20.0
+
+# Optional: imageio-ffmpeg (auto-downloads FFmpeg if not on PATH)
+# imageio-ffmpeg>=0.4.9
+
+# Utilities
+requests>=2.31.0
+
+
+=== telegram_trigger.py ===
+"""
+telegram_trigger.py â€” Optional Telegram bot for mobile control of GTA6 AI Content Factory
+
+Commands:
+  /start   â€” Welcome message and help
+  /help    â€” List commands
+  /run     â€” Start a new clip job (DM the URL after)
+  /status  â€” Check current job status
+  /clips   â€” List generated clips
+  /approve â€” Mark a clip as approved for upload
+  /reject  â€” Mark a clip as rejected
+
+Setup:
+  1. Create a bot with @BotFather on Telegram
+  2. Add TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER to .env
+  3. Run: python telegram_trigger.py
+
+Requirements:
+  pip install python-telegram-bot
+
+Security: Only responds to TELEGRAM_ALLOWED_USER (your Telegram user ID).
+"""
+import json
+import logging
+import os
+import sys
+import threading
+from pathlib import Path
+
+try:
+    from telegram import Update
+    from telegram.ext import (
+        Application, CommandHandler, MessageHandler,
+        filters, ContextTypes
+    )
+    TELEGRAM_AVAILABLE = True
+except ImportError:
+    TELEGRAM_AVAILABLE = False
+
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER, OUTPUT_DIR
+
+logger = logging.getLogger("telegram_trigger")
+
+# ---------------------------------------------------------------------------
+# Job state (in-memory, single process)
+# ---------------------------------------------------------------------------
+_job_state = {
+    "running": False,
+    "url":     None,
+    "status":  "idle",
+    "clips":   [],
+}
+_pending_url_from_user: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Auth guard
+# ---------------------------------------------------------------------------
+
+def _is_authorized(update: Update) -> bool:
+    allowed = TELEGRAM_ALLOWED_USER.strip()
+    if not allowed:
+        logger.warning("TELEGRAM_ALLOWED_USER not set â€” denying all requests.")
+        return False
+    user_id = str(update.effective_user.id)
+    return user_id == allowed
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+    await update.message.reply_text(
+        "ðŸŽ® *GTA6 AI Content Factory* â€” Mobile Control\n\n"
+        "Commands:\n"
+        "/run â€” Send me a YouTube URL to process\n"
+        "/status â€” Check current job\n"
+        "/clips â€” List generated clips\n"
+        "/approve N â€” Approve clip #N\n"
+        "/reject N â€” Reject clip #N\n"
+        "/help â€” Show this message",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+    if _job_state["running"]:
+        await update.message.reply_text(
+            f"âš ï¸ A job is already running for:\n{_job_state['url']}\n\nStatus: {_job_state['status']}"
+        )
+        return
+    user_id = str(update.effective_user.id)
+    _pending_url_from_user[user_id] = True
+    await update.message.reply_text(
+        "ðŸ“Ž Send me the YouTube URL to process.\n\n"
+        "Example: https://www.youtube.com/watch?v=XXXX"
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+    if _job_state["running"]:
+        await update.message.reply_text(
+            f"âš™ï¸ Processing: {_job_state['url']}\nStatus: {_job_state['status']}"
+        )
+    else:
+        await update.message.reply_text(
+            f"ðŸ’¤ No job running.\nLast status: {_job_state['status']}"
+        )
+
+
+async def cmd_clips(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+    clips = list(OUTPUT_DIR.glob("*.mp4"))
+    if not clips:
+        await update.message.reply_text("ðŸ“‚ No clips in output_clips/ yet.")
+        return
+    lines = [f"ðŸ“¹ Generated clips ({len(clips)} found):"]
+    for i, c in enumerate(clips[:10], 1):
+        size_mb = c.stat().st_size / 1_048_576
+        lines.append(f"  #{i}: {c.name} ({size_mb:.1f} MB)")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+    clips = list(OUTPUT_DIR.glob("*.mp4"))
+    args  = context.args
+    if args and args[0].isdigit():
+        idx = int(args[0]) - 1
+        if 0 <= idx < len(clips):
+            clip = clips[idx]
+            # Write approval marker
+            (clip.parent / (clip.stem + ".approved")).touch()
+            await update.message.reply_text(f"âœ… Approved: {clip.name}")
+            return
+    await update.message.reply_text("Usage: /approve N (use /clips to see numbers)")
+
+
+async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+    clips = list(OUTPUT_DIR.glob("*.mp4"))
+    args  = context.args
+    if args and args[0].isdigit():
+        idx = int(args[0]) - 1
+        if 0 <= idx < len(clips):
+            clip = clips[idx]
+            (clip.parent / (clip.stem + ".rejected")).touch()
+            await update.message.reply_text(f"âŒ Rejected: {clip.name}")
+            return
+    await update.message.reply_text("Usage: /reject N (use /clips to see numbers)")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+
+    user_id = str(update.effective_user.id)
+    text    = (update.message.text or "").strip()
+
+    if _pending_url_from_user.pop(user_id, False):
+        # User just sent a URL after /run
+        if not text.startswith("http"):
+            await update.message.reply_text("âŒ That doesn't look like a URL. Use /run to try again.")
+            return
+
+        url = text
+        await update.message.reply_text(
+            f"ðŸš€ Starting pipeline for:\n{url}\n\nThis runs locally on your PC."
+        )
+
+        def _run_pipeline():
+            _job_state["running"] = True
+            _job_state["url"]     = url
+            _job_state["status"]  = "extracting signals..."
+            try:
+                from pipeline import run_pipeline
+                result = run_pipeline(url=url, max_clips=5, top_n=3)
+                _job_state["status"] = "done"
+                _job_state["clips"]  = [
+                    r.get("path") for r in result.get("results", [])
+                    if r.get("success")
+                ]
+                # Notify user (best effort â€” requires bot still running)
+                n = result.get("clips_built", 0)
+                # Can't use await here (non-async thread) â€” just update state
+                logger.info(f"Telegram pipeline done: {n} clips built")
+            except Exception as e:
+                _job_state["status"] = f"error: {e}"
+                logger.error(f"Pipeline error: {e}")
+            finally:
+                _job_state["running"] = False
+
+        threading.Thread(target=_run_pipeline, daemon=True).start()
+        await update.message.reply_text(
+            "âš™ï¸ Pipeline started! Use /status to check progress."
+        )
+    else:
+        await update.message.reply_text(
+            "Use /run to start a new job, or /help for commands."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def run_bot():
+    if not TELEGRAM_AVAILABLE:
+        print("âŒ python-telegram-bot not installed. Run: pip install python-telegram-bot")
+        sys.exit(1)
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("âŒ TELEGRAM_BOT_TOKEN not set in .env")
+        sys.exit(1)
+
+    if not TELEGRAM_ALLOWED_USER:
+        print("âš ï¸  TELEGRAM_ALLOWED_USER not set â€” bot will refuse all requests!")
+
+    logging.basicConfig(level=logging.INFO)
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("run",     cmd_run))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("clips",   cmd_clips))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("reject",  cmd_reject))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print(f"ðŸ¤– Telegram bot started. Authorized user: {TELEGRAM_ALLOWED_USER or '(none)'}")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    run_bot()
+
+
+=== clip.yml ===
+# GTA6 AI Content Factory â€” GitHub Actions Workflow
+# Triggers: manual dispatch via GitHub UI or API (e.g., from Telegram bot)
+#
+# IMPORTANT NOTES:
+# - GitHub-hosted runners (ubuntu-latest) use datacenter IPs.
+# - YouTube actively restricts or throttles downloads from datacenter IPs.
+# - Using cookies (via YOUTUBE_COOKIES secret) may help for authenticated content
+#   but does NOT guarantee successful downloads.
+# - For heavy video rendering, prefer your local PC as the primary machine.
+# - This workflow is best used for: Gemini analysis, metadata generation,
+#   and triggering a local render job via webhook/artifact notification.
+#
+# Secrets required (set in GitHub repository Settings â†’ Secrets):
+#   GEMINI_API_KEY    â€” Your Gemini API key
+#   YOUTUBE_COOKIES   â€” Optional: contents of cookies.txt (base64 encoded)
+
+name: GTA6 Clip Factory
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube URL of the gaming VOD or stream'
+        required: true
+        type: string
+      clips:
+        description: 'Number of viral moments to identify (default: 5)'
+        required: false
+        default: '5'
+        type: string
+      top:
+        description: 'Top N clips to build (default: 3)'
+        required: false
+        default: '3'
+        type: string
+
+jobs:
+  generate-clips:
+    name: Generate GTA6 Shorts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            yt-dlp \
+            "google-genai>=0.8.0" \
+            "pydantic>=2.0.0" \
+            python-dotenv \
+            opencv-python-headless \
+            requests
+
+      - name: Restore YouTube cookies (if provided)
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" | base64 -d > cookies.txt
+            echo "âœ“ YouTube cookies restored"
+          else
+            echo "â„¹ No YOUTUBE_COOKIES secret â€” proceeding without authentication"
+          fi
+
+      - name: Run GTA6 AI Content Factory
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          echo "ðŸŽ® Processing: ${{ inputs.url }}"
+          python main.py \
+            "${{ inputs.url }}" \
+            --clips "${{ inputs.clips }}" \
+            --top "${{ inputs.top }}" \
+            --out output_clips \
+            --debug
+
+      - name: Upload generated clips as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gta6-clips-${{ github.run_number }}
+          path: |
+            output_clips/*.mp4
+            output_clips/*.json
+          retention-days: 7
+
+      - name: Upload logs as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pipeline-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 3
+
+

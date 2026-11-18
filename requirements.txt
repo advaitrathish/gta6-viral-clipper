@@ -1,0 +1,33 @@
+# GTA6 AI Content Factory — Required Python packages
+# Install with: pip install -r requirements.txt
+
+# Core
+yt-dlp>=2024.11.4
+google-genai>=0.8.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+opencv-python>=4.8.0
+
+# Optional: faster-whisper for local audio transcription when no subtitles available
+# Uncomment if needed (requires CUDA or CPU-only build)
+# faster-whisper>=1.0.0
+
+# Optional: YouTube Data API for publishing
+# Uncomment to enable publishing
+# google-api-python-client>=2.0.0
+# google-auth-oauthlib>=1.0.0
+# google-auth-httplib2>=0.1.0
+
+# Optional: Telegram bot for mobile control
+# Uncomment to enable Telegram integration
+# python-telegram-bot>=20.0
+
+# Optional: imageio-ffmpeg (auto-downloads FFmpeg if not on PATH)
+# imageio-ffmpeg>=0.4.9
+
+# Utilities
+requests>=2.31.0
+
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
