@@ -43,6 +43,7 @@ jobs:
           sudo apt-get -o Acquire::ForceIPv4=true install -y -qq ffmpeg fonts-dejavu-core
           pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Decode YouTube cookies & Google Drive token
         env:
           YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
