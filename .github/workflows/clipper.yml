@@ -59,6 +59,7 @@ jobs:
       - name: Run Live Radar or Single URL Clipper
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GDRIVE_TOKEN_B64: ${{ secrets.GDRIVE_TOKEN_B64 }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           VIDEO_URL: ${{ github.event.inputs.video_url }}
           TOP_CLIPS: ${{ github.event.inputs.top_clips || '1' }}
