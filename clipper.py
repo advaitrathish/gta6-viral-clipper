@@ -270,12 +270,13 @@ def render_vertical_short(
         # Dynamic facecam crop or fallback corner crop
         if face_box:
             fx, fy, fw, fh = face_box
-            pad_x = int(fw * 1.2)
-            pad_y = int(fh * 1.8)
-            crop_x = max(0, fx - int(fw * 0.6))
-            crop_y = max(0, fy - int(fh * 0.5))
-            crop_w = min(width - crop_x, int(fw * 2.8) + pad_x)
-            crop_h = min(height - crop_y, int(fh * 2.5) + pad_y)
+            # Push the crop window higher up to include hair and headphones
+            pad_x = int(fw * 1.4)
+            pad_y = int(fh * 2.2)
+            crop_x = max(0, fx - int(fw * 0.7))
+            crop_y = max(0, fy - int(fh * 1.2))
+            crop_w = min(width - crop_x, int(fw * 3.0) + pad_x)
+            crop_h = min(height - crop_y, int(fh * 2.8) + pad_y)
 
             cam_crop = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
             layout_label = f"Dynamic Facecam Box ({crop_w}x{crop_h} @ {crop_x},{crop_y})"
