@@ -34,15 +34,15 @@ GEMINI_MODELS = (
     [m.strip() for m in _env_models.split(",") if m.strip()]
     if _env_models
     else [
-        "gemini-4-hydrogen",       # Replace with exact hydrogen ID from list above
-        "gemini-3.8-flash",        # Workhorse fallback 1
-        "gemini-4-carbon",         # Replace with exact carbon ID from list above
-        "gemini-3.6-flash",        # Fast fallback 3
-        "gemini-3.5-flash-lite",   # Low-latency fallback 4
+        "gemini-4-hydrogen",
+        "gemini-3.8-flash",
+        "gemini-4-carbon",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
     ]
 )
-GEMINI_MAX_RETRIES  = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
-GEMINI_BACKOFF_SEC  = float(os.getenv("GEMINI_BACKOFF_SEC", "2.0"))
+GEMINI_MAX_RETRIES  = int(os.getenv("GEMINI_MAX_RETRIES", "1"))
+GEMINI_BACKOFF_SEC  = float(os.getenv("GEMINI_BACKOFF_SEC", "1.5"))
 GEMINI_TEMPERATURE  = float(os.getenv("GEMINI_TEMPERATURE", "0.4"))
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ def find_font() -> str:
     if system == "Windows":
         win_fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
         candidates = [
-            win_fonts / "arialbd.ttf",   # Arial Bold
+            win_fonts / "arialbd.ttf",
             win_fonts / "arial.ttf",
             win_fonts / "impact.ttf",
             win_fonts / "verdanab.ttf",
@@ -95,7 +95,6 @@ def find_font() -> str:
     for c in candidates:
         if c.exists():
             return str(c)
-    # Last resort: ask fontconfig
     fc = shutil.which("fc-match")
     if fc:
         import subprocess
@@ -108,7 +107,7 @@ def find_font() -> str:
                 return result.stdout.strip()
         except Exception:
             pass
-    return "Arial"   # FFmpeg built-in fallback
+    return "Arial"
 
 FONT_PATH = find_font()
 

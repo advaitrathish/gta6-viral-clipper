@@ -236,7 +236,7 @@ HARD RULES (DO NOT VIOLATE):
 - Start 2-3 seconds BEFORE the main action so viewers have context.
 - Cut immediately after the punchline, peak reaction, or resolution.
 - DO NOT overlap clips — each must cover a unique time range.
-- DO NOT fabricate gameplay details not evident from the transcript.
+- DO NOT fabricate gameplay details not evident from the transcript or chat.
 - hook_overlay and mid_callout MUST describe the specific scene/event in plain English (NEVER use generic filler like 'NO WAY THAT JUST HAPPENED' or 'WAIT FOR IT').
 - Include exactly 3 alternative hooks with different emotional tones.
 - Hashtags MUST include #GTA6 and #Shorts when relevant.
@@ -248,9 +248,10 @@ Return ONLY valid JSON matching this JSON Schema:
 
     last_err: Optional[Exception] = None
     all_valid: List[ViralClip] = []
+    max_attempts = max(1, min(GEMINI_MAX_RETRIES + 1, 2))
 
     for model_name in GEMINI_MODELS:
-        for attempt in range(GEMINI_MAX_RETRIES + 1):
+        for attempt in range(max_attempts):
             try:
                 print(f"[Analyzer] -> {model_name} (attempt {attempt + 1}) sending {cue_count} cues...")
                 response = client.models.generate_content(
@@ -260,7 +261,7 @@ Return ONLY valid JSON matching this JSON Schema:
                         response_mime_type="application/json",
                         temperature=GEMINI_TEMPERATURE,
                         thinking_config=_get_thinking_config(model_name, types),
-                        http_options=types.HttpOptions(timeout=45_000),
+                        http_options=types.HttpOptions(timeout=25_000),
                     ),
                 )
                 plan = ClipPlan.model_validate_json(response.text)
@@ -278,10 +279,9 @@ Return ONLY valid JSON matching this JSON Schema:
                 else:
                     print(
                         f"[Analyzer] {model_name} returned {len(plan.clips)} clips but NONE "
-                        f"passed validation. Retrying..."
+                        f"passed validation."
                     )
-                    if attempt == 0:
-                        continue
+                    break
             except (ValidationError, json.JSONDecodeError) as je:
                 last_err = je
                 print(f"[Analyzer] {model_name}: JSON/Validation error — {je}")
@@ -289,14 +289,20 @@ Return ONLY valid JSON matching this JSON Schema:
             except Exception as e:
                 last_err = e
                 err_str = str(e).lower()
-                if any(x in err_str for x in ("quota", "rate", "429", "503", "timeout")):
-                    wait = GEMINI_BACKOFF_SEC * (2 ** attempt)
-                    print(f"[Analyzer] {model_name}: transient error ({e}). Waiting {wait:.1f}s...")
-                    time.sleep(wait)
-                    continue
-                else:
-                    print(f"[Analyzer] {model_name}: permanent error ({type(e).__name__}: {e})")
+                # Hard quota / limit: 0 will never succeed on retry -> skip to next model immediately
+                if "limit: 0" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
+                    print(f"[Analyzer] {model_name}: quota/limit reached — switching model immediately...")
                     break
+                if any(x in err_str for x in ("rate", "429", "503", "unavailable", "timeout", "deadline")):
+                    if attempt < max_attempts - 1:
+                        wait = min(GEMINI_BACKOFF_SEC, 1.5)
+                        print(f"[Analyzer] {model_name}: transient spike ({type(e).__name__}). Retrying in {wait:.1f}s...")
+                        time.sleep(wait)
+                        continue
+                    print(f"[Analyzer] {model_name}: still busy — switching to fallback model...")
+                    break
+                print(f"[Analyzer] {model_name}: permanent error ({type(e).__name__}: {e})")
+                break
 
         if all_valid:
             break

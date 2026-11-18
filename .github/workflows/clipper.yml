@@ -2,7 +2,7 @@ name: GTA6 Viral Clipper
 
 on:
   schedule:
-    - cron: '15 * * * *'
+    - cron: '23 * * * *'
   workflow_dispatch:
     inputs:
       mode:

@@ -1,11 +1,10 @@
 """
 live_chat_watcher.py — Unified Live Stream, Ended Stream Replay (VOD), and Upload Clipper
 Supports:
-  - mode="live": Real-time live chat spike listener
-  - mode="vod_replay": Full ended-stream Live Chat Replay analyzer (with graceful partial-chat fallback)
-  - mode="upload": Standard uploaded video pipeline (heatmap/transcript via pipeline.py)
-  - mode="auto": Automatically detects live vs ended stream vs standard upload
-Includes min_clips guarantee, mega-stream relative burst scoring, singleton Whisper, and backward-compatible run_live_monitor().
+- mode="live": Real-time live chat spike listener
+- mode="vod_replay": Hybrid Heatmap + Filtered Live Chat Replay analyzer for ended streams
+- mode="upload": Standard uploaded video pipeline (heatmap/transcript via pipeline.py)
+- mode="auto": Automatically detects live vs ended stream vs standard upload
 """
 import argparse
 import json
@@ -35,6 +34,12 @@ logger = logging.getLogger("live_chat_watcher")
 HYPE_PATTERN = re.compile(
     r"\b(w+|l+|lmao+|lmfao+|lol+|wtf+|omg+|no\s*way|what+|bro+|clip(\s*it)?|gg+|ez+|"
     r"op+|bhai+|arey+|abe+|kya+|pagal|gajab|mast|khatarnak|haha+|xd+|💀|😭|🔥|😱|😂)\b",
+    re.IGNORECASE,
+)
+
+SPAM_IGNORE_PATTERN = re.compile(
+    r"\b(giveaway|redeem|code|superchat|member|membership|sub|subscribe|like\s*karo|"
+    r"discord|instagram|insta|sponsor|ad|break|starting\s*soon|intro|shoutout)\b",
     re.IGNORECASE,
 )
 
@@ -108,7 +113,7 @@ def get_live_metadata(url: str) -> dict:
 
 
 def collect_chat_json(url: str, duration_sec: int = 1800, is_vod_replay: bool = False) -> Path:
-    """Download full replay chat (VOD) up to 900s or record live chat for duration_sec without crashing."""
+    """Download replay chat (VOD) up to 360s or record live chat for duration_sec without crashing."""
     chat_prefix = WORKSPACE_DIR / "live_chat_capture"
     for old in WORKSPACE_DIR.glob("live_chat_capture*"):
         old.unlink(missing_ok=True)
@@ -125,9 +130,9 @@ def collect_chat_json(url: str, duration_sec: int = 1800, is_vod_replay: bool = 
         cmd += ["--cookies", str(COOKIES_FILE)]
     cmd.append(url)
 
-    wait_limit = 900 if is_vod_replay else duration_sec
+    wait_limit = 360 if is_vod_replay else duration_sec
     logger.info(
-        f"{'Downloading full VOD Live Chat Replay JSON' if is_vod_replay else 'Listening to live chat'} "
+        f"{'Downloading VOD Live Chat Replay JSON' if is_vod_replay else 'Listening to live chat'} "
         f"(max {wait_limit}s)..."
     )
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -156,7 +161,10 @@ def detect_chat_spikes(
     top_k: int = 5,
     is_vod_replay: bool = False,
 ) -> list[dict]:
-    """Parse live or replay chat JSONL and rank 10s buckets using relative surge + hype density."""
+    """
+    Parse live or replay chat JSONL and rank 10s buckets using relative surge + hype density.
+    Filters out stream intros (< 4 min) and giveaway/promo chat spam while keeping a safe fallback.
+    """
     buckets = defaultdict(lambda: {"authors": set(), "hype_authors": set(), "messages": []})
     first_msg_sec = None
 
@@ -263,7 +271,8 @@ def detect_chat_spikes(
     median_hype = max(2.0, float(statistics.median(hypes)))
 
     base_ts = 0.0 if is_vod_replay else (float(stream_start_ts) if stream_start_ts else float(first_msg_sec or 0))
-    scored = []
+    clean_scored = []
+    unfiltered_fallback = []
 
     for b_sec, info in sorted(buckets.items()):
         unique_total = len(info["authors"])
@@ -274,24 +283,37 @@ def detect_chat_spikes(
         surge_ratio = (unique_total / median_total) + (unique_hype / median_hype) * 1.5
         hype_density = unique_hype / max(1, unique_total)
         score = (unique_hype * 2.0) + (unique_total * 0.6) + (surge_ratio * 12.0) + (hype_density * 15.0)
-
         offset_sec = float(b_sec) if is_vod_replay else max(0.0, b_sec - base_ts)
-        scored.append({
+
+        entry = {
             "bucket_sec": b_sec,
             "offset_sec": offset_sec,
             "score": round(score, 2),
             "unique_total": unique_total,
             "unique_hype": unique_hype,
             "sample_chat": info["messages"],
-        })
+        }
+        unfiltered_fallback.append(entry)
 
-    scored.sort(key=lambda x: x["score"], reverse=True)
+        # Filter 1: Skip stream starting/intro screen (first 4 minutes of VOD)
+        if is_vod_replay and offset_sec < 240.0:
+            continue
+
+        # Filter 2: Skip giveaway/promo/shoutout chat spam floods
+        spam_count = sum(1 for m in info["messages"] if SPAM_IGNORE_PATTERN.search(m))
+        if spam_count >= max(3, int(len(info["messages"]) * 0.4)):
+            continue
+
+        clean_scored.append(entry)
+
+    # Guarantee we never end up empty if filters were too strict on a short stream
+    pool = clean_scored if clean_scored else unfiltered_fallback
+    pool.sort(key=lambda x: x["score"], reverse=True)
 
     selected = []
-    for cand in scored:
+    for cand in pool:
         if any(abs(cand["offset_sec"] - s["offset_sec"]) < 75 for s in selected):
             continue
-        # Chat reaction arrives 3-8s after the play; frame [offset-38s, offset+12s] to catch full buildup
         start_s = max(0.0, cand["offset_sec"] - 38.0)
         end_s = start_s + 50.0
         cand["start_ts"] = _format_ts(start_s)
@@ -434,14 +456,8 @@ def _transcribe_live_cues(raw_path: Path) -> list[dict]:
         return []
 
 
-def _generate_live_clip_meta(spike: dict, stream_meta: dict) -> dict:
-    """Pass chat + spike signals into analyzer.find_viral_clips for Gemini hook/title & virality scoring."""
-    synthetic_transcript = (
-        f"[00:00:00 -> 00:00:50] CHAT EXPLOSION "
-        f"({spike['unique_hype']} hype viewers / {spike['unique_total']} total active): "
-        + " | ".join(spike["sample_chat"][:15])
-    )
-    fallback = {
+def _default_spike_meta(spike: dict, stream_meta: dict) -> dict:
+    return {
         "start_time": "00:00:00",
         "end_time": "00:00:50",
         "duration_sec": 50.0,
@@ -449,34 +465,80 @@ def _generate_live_clip_meta(spike: dict, stream_meta: dict) -> dict:
         "confidence": 88,
         "category": "comedy",
         "title": f"{stream_meta['channel']} Insane Stream Moment",
-        "hook_overlay": "CHAT WENT CRAZY HERE",
-        "hashtags": ["#Shorts", "#Gaming", "#Viral", "#Live"],
+        "hook_overlay": "LIVE CHAT EXPLODED AT THIS MOMENT",
+        "mid_callout": "WATCH THE STREAMER REACTION HERE",
+        "hashtags": ["#Shorts", "#GTA6", "#Gaming", "#Live"],
         "reason": f"Chat spiked with {spike['unique_hype']} unique viewers reacting simultaneously.",
     }
+
+
+def _score_spikes_batched(spikes: list[dict], stream_meta: dict, max_clips: int) -> list[tuple[int, dict, dict]]:
+    """Score all top chat spikes in ONE single Gemini request so fallback takes < 5 seconds."""
+    if not spikes:
+        return []
+
+    combined_lines = []
+    chat_spike_items = []
+    for sp in spikes:
+        s_sec = sp["start_sec"]
+        e_sec = sp["end_sec"]
+        sample_txt = " | ".join(sp["sample_chat"][:12])
+        combined_lines.append(
+            f"[{s_sec:.1f}s] WINDOW {s_sec:.1f}s-{e_sec:.1f}s | CHAT SPIKE "
+            f"({sp['unique_hype']} hype / {sp['unique_total']} active): {sample_txt}"
+        )
+        chat_spike_items.append({
+            "start_sec": sp["offset_sec"],
+            "msgs_in_10s": sp["unique_total"],
+            "hype_msgs": sp["unique_hype"],
+        })
+
     try:
         signals = {
             "video_id": stream_meta.get("video_id", "live"),
             "title": stream_meta.get("title", "Stream"),
-            "channel": stream_meta.get("channel", ""),
-            "duration": 50,
-            "transcript": synthetic_transcript,
-            "heatmap": [],
-            "comments": spike["sample_chat"][:15],
+            "duration_sec": float(stream_meta.get("duration") or 0.0),
+            "transcript": "\n".join(combined_lines),
+            "heatmap_peaks": [],
+            "chat_spikes": chat_spike_items,
         }
-        clips = find_viral_clips(signals=signals, max_clips=1)
-        if clips:
-            c = dict(clips[0])
-            c["start_time"] = "00:00:00"
-            c["end_time"] = "00:00:50"
-            c["duration_sec"] = 50.0
-            return c
+        ai_clips = find_viral_clips(signals=signals, max_clips=max(max_clips, len(spikes)))
+        if ai_clips:
+            matched: list[tuple[int, dict, dict]] = []
+            used_spikes = set()
+            for c in ai_clips:
+                c_mid = (float(c["start_sec"]) + float(c["end_sec"])) / 2.0
+                best_idx = None
+                best_dist = 999999.0
+                for idx, sp in enumerate(spikes):
+                    if idx in used_spikes:
+                        continue
+                    dist = abs(sp["offset_sec"] - c_mid)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = idx
+                if best_idx is not None and best_dist <= 90.0:
+                    used_spikes.add(best_idx)
+                    sp = spikes[best_idx]
+                    c_copy = dict(c)
+                    c_copy["start_time"] = "00:00:00"
+                    c_copy["end_time"] = "00:00:50"
+                    c_copy["duration_sec"] = 50.0
+                    matched.append((int(c_copy.get("virality_score", 85)), sp, c_copy))
+
+            for idx, sp in enumerate(spikes):
+                if idx not in used_spikes:
+                    fb = _default_spike_meta(sp, stream_meta)
+                    matched.append((fb["virality_score"], sp, fb))
+            return matched
     except Exception as e:
-        logger.warning(f"Gemini metadata fallback triggered: {e}")
-    return fallback
+        logger.warning(f"Gemini batched metadata fallback triggered: {e}")
+
+    return [(_default_spike_meta(sp, stream_meta)["virality_score"], sp, _default_spike_meta(sp, stream_meta)) for sp in spikes]
 
 
 def run_upload_pipeline(url: str, min_clips: int = 1, max_clips: int = 2) -> dict:
-    """Standard uploaded video mode (uses heatmap + transcript via pipeline.py)."""
+    """Standard uploaded video / heatmap mode (uses heatmap + transcript via pipeline.py)."""
     from pipeline import run_pipeline
     from drive_uploader import upload_clip_to_drive
 
@@ -495,7 +557,7 @@ def run_monitor(
     min_clips: int = 1,
     max_clips: int = 2,
 ) -> dict:
-    """Unified entrypoint for live streams, ended stream chat replays, and uploaded videos."""
+    """Unified entrypoint for live streams, ended stream chat/heatmap replays, and uploaded videos."""
     t0 = time.time()
     max_clips = max(1, max_clips)
     min_clips = max(0, min(min_clips, max_clips))
@@ -522,6 +584,21 @@ def run_monitor(
         logger.warning("Stream is no longer live — automatically switching to 'vod_replay' mode!")
         is_vod_replay = True
 
+    # For ended streams (vod_replay), check YouTube's 'Most Replayed' heatmap first:
+    # viewers rewind real gameplay moments, skipping intro screens & giveaway chat floods.
+    if is_vod_replay:
+        try:
+            from extractor import fetch_video_signals
+            sigs = fetch_video_signals(meta["webpage_url"])
+            if sigs.get("heatmap_peaks"):
+                logger.info(
+                    f"Found {len(sigs['heatmap_peaks'])} YouTube 'Most Replayed' heatmap peaks — "
+                    "running heatmap + transcript pipeline!"
+                )
+                return run_upload_pipeline(meta["webpage_url"], min_clips=min_clips, max_clips=max_clips)
+        except Exception as e:
+            logger.info(f"Heatmap check skipped ({e}) — falling back to filtered VOD chat replay.")
+
     try:
         chat_file = collect_chat_json(
             meta["webpage_url"],
@@ -534,7 +611,7 @@ def run_monitor(
             return run_upload_pipeline(meta["webpage_url"], min_clips=min_clips, max_clips=max_clips)
         raise
 
-    candidate_pool = max(6, max_clips * 3)
+    candidate_pool = max(4, max_clips * 2)
     spikes = detect_chat_spikes(
         chat_file,
         meta.get("release_timestamp"),
@@ -553,13 +630,12 @@ def run_monitor(
             "summary": f"No major chat spikes detected during {listen_sec}s window on {meta['title']} — skipped.",
         }
 
-    scored_candidates = []
-    for sp in spikes:
-        if not is_vod_replay and _is_already_clipped(meta["video_id"], sp["bucket_sec"]):
-            continue
-        clip_meta = _generate_live_clip_meta(sp, meta)
-        scored_candidates.append((clip_meta.get("virality_score", 0), sp, clip_meta))
+    unclipped_spikes = [
+        sp for sp in spikes
+        if is_vod_replay or not _is_already_clipped(meta["video_id"], sp["bucket_sec"])
+    ]
 
+    scored_candidates = _score_spikes_batched(unclipped_spikes, meta, max_clips=max_clips)
     scored_candidates.sort(key=lambda x: x[0], reverse=True)
 
     chosen = []
@@ -587,7 +663,7 @@ def run_monitor(
         rendered = render_vertical_short(
             raw_path=raw_slice,
             out_path=out_mp4,
-            hook_text=clip_meta.get("hook_overlay", "CHAT WENT CRAZY HERE"),
+            hook_text=clip_meta.get("hook_overlay", "LIVE CHAT EXPLODED AT THIS MOMENT"),
             cues=cues,
             clip_start_sec=clip_start_sec,
             clip_end_sec=clip_end_sec,
