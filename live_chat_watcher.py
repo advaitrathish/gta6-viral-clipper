@@ -254,7 +254,7 @@ def slice_live_segment(url: str, start_ts: str, end_ts: str, out_path: Path, sec
     url_cmd = [
         "yt-dlp",
         "-g",
-        "-f", "best[height<=1080][protocol!*=dash]/best[protocol!*=dash]/best",
+        "-f", "best[protocol*=m3u8][height<=1080]/best[height<=1080][protocol!*=dash]/best",
         "--remote-components", "ejs:github",
     ]
     if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
@@ -269,13 +269,12 @@ def slice_live_segment(url: str, start_ts: str, end_ts: str, out_path: Path, sec
     ffmpeg_bin = get_ffmpeg_exe()
     seek_back = f"-{max(55, int(seconds_ago + 35))}"
 
-    inputs = ["-sseof", seek_back, "-i", stream_urls[0]]
-    maps = ["-map", "0:v:0"]
-    if len(stream_urls) > 1:
-        inputs += ["-sseof", seek_back, "-i", stream_urls[1]]
-        maps += ["-map", "1:a:0"]
+    if len(stream_urls) == 1:
+        inputs = ["-sseof", seek_back, "-i", stream_urls[0]]
+        maps = ["-map", "0:v:0", "-map", "0:a?"]
     else:
-        maps += ["-map", "0:a?"]
+        inputs = ["-sseof", seek_back, "-i", stream_urls[0], "-sseof", seek_back, "-i", stream_urls[1]]
+        maps = ["-map", "0:v:0", "-map", "1:a:0"]
 
     ff_cmd = [
         ffmpeg_bin, "-y",

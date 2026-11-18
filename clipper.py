@@ -270,10 +270,10 @@ def render_vertical_short(
 
         # Full 16:9 corner slice (36% width x 36% height) captures the entire webcam box
         corner_crops = {
-            "top-right":    "crop=iw*0.36:ih*0.36:iw*0.64:0",
-            "top-left":     "crop=iw*0.36:ih*0.36:0:0",
-            "bottom-right": "crop=iw*0.36:ih*0.36:iw*0.64:ih*0.64",
-            "bottom-left":  "crop=iw*0.36:ih*0.36:0:ih*0.64",
+            "top-right":    "crop=iw*0.28:ih*0.28:iw*0.72:0",
+            "top-left":     "crop=iw*0.28:ih*0.28:0:0",
+            "bottom-right": "crop=iw*0.28:ih*0.28:iw*0.72:ih*0.72",
+            "bottom-left":  "crop=iw*0.28:ih*0.28:0:ih*0.72",
         }
 
         layout_label = f"Full Corner Webcam ({corner})" if corner else "Full-Frame Gameplay (No Facecam)"
