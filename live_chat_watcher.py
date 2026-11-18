@@ -2,7 +2,7 @@
 live_chat_watcher.py — Unified Live Stream, Ended Stream Replay (VOD), and Upload Clipper
 Supports:
   - mode="live": Real-time live chat spike listener
-  - mode="vod_replay": Full ended-stream Live Chat Replay analyzer (scans entire 2-3h VOD in ~20s)
+  - mode="vod_replay": Full ended-stream Live Chat Replay analyzer (with graceful partial-chat fallback)
   - mode="upload": Standard uploaded video pipeline (heatmap/transcript via pipeline.py)
   - mode="auto": Automatically detects live vs ended stream vs standard upload
 Includes min_clips guarantee, mega-stream relative burst scoring, singleton Whisper, and backward-compatible run_live_monitor().
@@ -108,7 +108,7 @@ def get_live_metadata(url: str) -> dict:
 
 
 def collect_chat_json(url: str, duration_sec: int = 1800, is_vod_replay: bool = False) -> Path:
-    """Download full replay chat immediately (VOD) or record live chat for duration_sec."""
+    """Download full replay chat (VOD) up to 900s or record live chat for duration_sec without crashing."""
     chat_prefix = WORKSPACE_DIR / "live_chat_capture"
     for old in WORKSPACE_DIR.glob("live_chat_capture*"):
         old.unlink(missing_ok=True)
@@ -125,27 +125,28 @@ def collect_chat_json(url: str, duration_sec: int = 1800, is_vod_replay: bool = 
         cmd += ["--cookies", str(COOKIES_FILE)]
     cmd.append(url)
 
-    if is_vod_replay:
-        logger.info("Downloading full VOD Live Chat Replay JSON...")
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-        if res.returncode != 0:
-            logger.warning(f"yt-dlp replay stderr: {res.stderr.strip()[-300:]}")
-    else:
-        logger.info(f"Listening to live chat for {duration_sec}s...")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    wait_limit = 900 if is_vod_replay else duration_sec
+    logger.info(
+        f"{'Downloading full VOD Live Chat Replay JSON' if is_vod_replay else 'Listening to live chat'} "
+        f"(max {wait_limit}s)..."
+    )
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        proc.wait(timeout=wait_limit)
+    except subprocess.TimeoutExpired:
+        logger.info("Chat capture window reached — stopping yt-dlp cleanly and using captured chat.")
+        proc.terminate()
         try:
-            proc.wait(timeout=duration_sec)
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            logger.info("Capture window reached — stopping live chat listener cleanly.")
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            proc.kill()
 
-    files = list(WORKSPACE_DIR.glob("live_chat_capture*.live_chat.json*"))
+    files = [
+        p for p in WORKSPACE_DIR.glob("live_chat_capture*.live_chat.json*")
+        if p.is_file() and p.stat().st_size > 0
+    ]
     if not files:
-        raise RuntimeError("No live_chat.json captured (chat may be disabled or still processing).")
+        raise RuntimeError("No live_chat.json captured (chat may be disabled, huge, or still processing).")
     return files[0]
 
 
