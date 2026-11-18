@@ -69,7 +69,10 @@ def _mark_clipped(video_id: str, bucket_sec: float) -> None:
 
 def get_live_metadata(url: str) -> dict:
     """Fetch video_id, title, is_live status, and release_timestamp from YouTube."""
-    cmd = ["yt-dlp", "--dump-json", "--no-playlist", "--no-warnings", "--js-runtimes", "deno", "--remote-components", "ejs:github"]
+    cmd = [
+        "yt-dlp", "--dump-json", "--no-playlist", "--no-warnings",
+        "--js-runtimes", "deno", "--remote-components", "ejs:github",
+    ]
     if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
         cmd += ["--cookies", str(COOKIES_FILE)]
     cmd.append(url)
@@ -139,33 +142,60 @@ def detect_chat_spikes(chat_file: Path, stream_start_ts: float | None, top_k: in
             except json.JSONDecodeError:
                 continue
 
-            actions = (
-                obj.get("replayChatItemAction", {}).get("actions")
-                or obj.get("addChatItemAction")
-                or []
-            )
+            if not isinstance(obj, dict):
+                continue
+
+            replay_action = obj.get("replayChatItemAction")
+            if isinstance(replay_action, dict):
+                actions = replay_action.get("actions") or []
+            elif "addChatItemAction" in obj:
+                actions = [obj]
+            else:
+                actions = []
+
             if isinstance(actions, dict):
                 actions = [actions]
+            if not isinstance(actions, list):
+                continue
 
             for act in actions:
-                item = act.get("addChatItemAction", {}).get("item", {})
+                if not isinstance(act, dict):
+                    continue
+                add_action = act.get("addChatItemAction")
+                if not isinstance(add_action, dict):
+                    continue
+                item = add_action.get("item")
+                if not isinstance(item, dict):
+                    continue
+
                 renderer = (
                     item.get("liveChatTextMessageRenderer")
                     or item.get("liveChatPaidMessageRenderer")
                 )
-                if not renderer:
+                if not isinstance(renderer, dict):
                     continue
 
                 usec = renderer.get("timestampUsec")
                 if not usec:
                     continue
-                msg_sec = int(usec) / 1_000_000.0
+                try:
+                    msg_sec = int(usec) / 1_000_000.0
+                except (TypeError, ValueError):
+                    continue
+
                 if first_msg_sec is None:
                     first_msg_sec = msg_sec
 
-                author = renderer.get("authorExternalChannelId") or renderer.get("authorName", {}).get("simpleText", "anon")
-                runs = renderer.get("message", {}).get("runs", [])
-                text = "".join(r.get("text", "") for r in runs).strip()
+                author_name_obj = renderer.get("authorName")
+                fallback_author = author_name_obj.get("simpleText", "anon") if isinstance(author_name_obj, dict) else "anon"
+                author = renderer.get("authorExternalChannelId") or fallback_author
+
+                msg_obj = renderer.get("message")
+                runs = msg_obj.get("runs", []) if isinstance(msg_obj, dict) else []
+                if not isinstance(runs, list):
+                    continue
+
+                text = "".join(r.get("text", "") for r in runs if isinstance(r, dict)).strip()
                 if not text:
                     continue
 
@@ -238,10 +268,19 @@ def slice_live_segment(url: str, start_ts: str, end_ts: str, out_path: Path, sec
 
     ffmpeg_bin = get_ffmpeg_exe()
     seek_back = f"-{max(55, int(seconds_ago + 35))}"
+
+    inputs = ["-sseof", seek_back, "-i", stream_urls[0]]
+    maps = ["-map", "0:v:0"]
+    if len(stream_urls) > 1:
+        inputs += ["-sseof", seek_back, "-i", stream_urls[1]]
+        maps += ["-map", "1:a:0"]
+    else:
+        maps += ["-map", "0:a?"]
+
     ff_cmd = [
         ffmpeg_bin, "-y",
-        "-sseof", seek_back,
-        "-i", stream_urls[0],
+        *inputs,
+        *maps,
         "-t", "50",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k",
@@ -368,7 +407,6 @@ def run_live_monitor(url: str, listen_sec: int = 1800, top_n: int = 1) -> dict:
         return vod_res
 
     chat_file = collect_live_chat(meta["webpage_url"], duration_sec=listen_sec)
-    # Grab top 3 candidate spikes so if #1 is already clipped or low-score, #2 can be evaluated
     spikes = detect_chat_spikes(chat_file, meta.get("release_timestamp"), top_k=max(3, top_n * 2))
 
     if not spikes:
