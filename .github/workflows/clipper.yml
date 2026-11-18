@@ -39,11 +39,10 @@ jobs:
 
       - name: Install system & Python dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          sudo apt-get -o Acquire::ForceIPv4=true update -qq
+          sudo apt-get -o Acquire::ForceIPv4=true install -y -qq ffmpeg fonts-dejavu-core
           pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Decode YouTube cookies & Google Drive token
         env:
           YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
